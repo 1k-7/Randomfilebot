@@ -19,8 +19,10 @@ from pyrogram.types import (
     CallbackQuery,
     ChatJoinRequest,
     ChatMemberUpdated,
+    InlineQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultCachedVideo,
     InputMediaAnimation,
     InputMediaAudio,
     InputMediaDocument,
@@ -172,6 +174,27 @@ def correct_file_type(rt: BotRuntime, item: IndexedFile, file_type: str) -> Inde
     return replace(item, file_type=file_type)
 
 
+def normalize_indexed_type(rt: BotRuntime, item: IndexedFile) -> IndexedFile:
+    detected = detect_file_type(item.file_id, item.file_type)
+    return correct_file_type(rt, item, detected)
+
+
+def find_random_video(rt: BotRuntime) -> IndexedFile | None:
+    for _ in range(5):
+        item = rt.db.random_file(file_type="video")
+        if not item:
+            break
+        item = normalize_indexed_type(rt, item)
+        if item.file_type == "video":
+            return item
+
+    for item in rt.db.random_files(100):
+        item = normalize_indexed_type(rt, item)
+        if item.file_type == "video":
+            return item
+    return None
+
+
 async def require_sudo(rt: BotRuntime, message: Message) -> bool:
     user = message.from_user
     if not user:
@@ -268,6 +291,41 @@ async def enforce_rate_limit_query(rt: BotRuntime, query: CallbackQuery) -> bool
         return True
     rt.db.record_denied(user.id, "denied_rate_limit")
     await query.answer("Rate limit reached. Try again later.", show_alert=True)
+    return False
+
+
+async def enforce_force_sub_inline(client: Client, rt: BotRuntime, query: InlineQuery) -> bool:
+    user = query.from_user
+    if not user:
+        return False
+    missing = await missing_force_sub_chats(client, rt, user.id)
+    if not missing:
+        return True
+    rt.db.record_denied(user.id, "denied_fsub_inline")
+    await query.answer(
+        [],
+        cache_time=0,
+        is_personal=True,
+        switch_pm_text="Join required chats first",
+        switch_pm_parameter="fsub",
+    )
+    return False
+
+
+async def enforce_rate_limit_inline(rt: BotRuntime, query: InlineQuery) -> bool:
+    user = query.from_user
+    if not user:
+        return False
+    if is_under_rate_limit(rt, user.id):
+        return True
+    rt.db.record_denied(user.id, "denied_rate_limit_inline")
+    await query.answer(
+        [],
+        cache_time=0,
+        is_personal=True,
+        switch_pm_text="Rate limit reached",
+        switch_pm_parameter="rate_limited",
+    )
     return False
 
 
@@ -666,6 +724,42 @@ def build_client(config: Config, db: Database) -> Client:
             exclude_file_id=exclude_file_id,
             event_type="refresh" if exclude_file_id is not None else "request",
         )
+
+    @app.on_inline_query()
+    async def inline_random_video(client: Client, query: InlineQuery) -> None:
+        await track_user(rt, query.from_user)
+        if query.query.strip():
+            await query.answer([], cache_time=0, is_personal=True)
+            return
+        if not await enforce_force_sub_inline(client, rt, query):
+            return
+        if not await enforce_rate_limit_inline(rt, query):
+            return
+        item = find_random_video(rt)
+        if not item:
+            await query.answer(
+                [],
+                cache_time=0,
+                is_personal=True,
+                switch_pm_text="No videos in the vault yet",
+                switch_pm_parameter="no_videos",
+            )
+            return
+        await query.answer(
+            [
+                InlineQueryResultCachedVideo(
+                    video_file_id=item.file_id,
+                    title="Send a random video from vault",
+                    id=f"vault-video-{item.id}",
+                    description=item.label or "Tap to send a random vault video.",
+                    caption=file_caption(item),
+                    parse_mode=ParseMode.HTML,
+                )
+            ],
+            cache_time=0,
+            is_personal=True,
+        )
+        rt.db.record_file_event(query.from_user.id, item.id, "inline")
 
     @app.on_message(filters.command("stats"))
     async def stats_command(client: Client, message: Message) -> None:

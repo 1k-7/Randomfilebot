@@ -231,23 +231,35 @@ class Database:
                 (file_type, file_db_id),
             )
 
-    def random_file(self, *, exclude_id: int | None = None) -> IndexedFile | None:
+    def random_file(
+        self,
+        *,
+        exclude_id: int | None = None,
+        file_type: str | None = None,
+    ) -> IndexedFile | None:
+        clauses: list[str] = []
+        params: list[object] = []
+        if exclude_id is not None:
+            clauses.append("id != ?")
+            params.append(exclude_id)
+        if file_type is not None:
+            clauses.append("file_type = ?")
+            params.append(file_type)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connect() as conn:
-            if exclude_id is not None:
-                row = conn.execute(
-                    """
-                    SELECT *
-                    FROM indexed_files
-                    WHERE id != ?
-                    ORDER BY RANDOM()
-                    LIMIT 1
-                    """,
-                    (exclude_id,),
-                ).fetchone()
-                if row:
-                    return self._file_from_row(row)
-            row = conn.execute("SELECT * FROM indexed_files ORDER BY RANDOM() LIMIT 1").fetchone()
+            row = conn.execute(
+                f"SELECT * FROM indexed_files {where} ORDER BY RANDOM() LIMIT 1",
+                params,
+            ).fetchone()
             return self._file_from_row(row) if row else None
+
+    def random_files(self, limit: int = 100) -> list[IndexedFile]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM indexed_files ORDER BY RANDOM() LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [self._file_from_row(row) for row in rows]
 
     def count_files(self) -> int:
         with self.connect() as conn:
@@ -299,9 +311,9 @@ class Database:
             return [self._force_sub_from_row(row) for row in rows]
 
     def record_file_event(self, user_id: int, file_db_id: int | None, event_type: str) -> None:
-        request_increment = 1 if event_type in {"request", "refresh"} else 0
+        request_increment = 1 if event_type in {"request", "refresh", "inline"} else 0
         refresh_increment = 1 if event_type == "refresh" else 0
-        sent_increment = 1 if event_type in {"request", "refresh"} and file_db_id else 0
+        sent_increment = 1 if event_type in {"request", "refresh", "inline"} and file_db_id else 0
         with self.connect() as conn:
             conn.execute(
                 """
@@ -356,7 +368,7 @@ class Database:
                 SELECT COUNT(*) AS count
                 FROM file_events
                 WHERE user_id = ?
-                  AND event_type IN ('request', 'refresh')
+                  AND event_type IN ('request', 'refresh', 'inline')
                   AND created_at >= ?
                 """,
                 (user_id, to_db_time(since)),
@@ -383,8 +395,8 @@ class Database:
                     (SELECT COUNT(*) FROM users WHERE is_blocked = 1) AS blocked,
                     (SELECT COUNT(*) FROM indexed_files) AS files,
                     (SELECT COUNT(*) FROM force_sub_chats WHERE enabled = 1) AS fsubs,
-                    (SELECT COUNT(*) FROM file_events WHERE event_type IN ('request', 'refresh')) AS requests,
-                    (SELECT COUNT(*) FROM file_events WHERE event_type IN ('request', 'refresh') AND created_at >= ?) AS recent_requests,
+                    (SELECT COUNT(*) FROM file_events WHERE event_type IN ('request', 'refresh', 'inline')) AS requests,
+                    (SELECT COUNT(*) FROM file_events WHERE event_type IN ('request', 'refresh', 'inline') AND created_at >= ?) AS recent_requests,
                     (SELECT COUNT(*) FROM file_events WHERE event_type LIKE 'denied%') AS denied
                 """,
                 (to_db_time(since),),

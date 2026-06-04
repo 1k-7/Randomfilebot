@@ -64,6 +64,12 @@ docker run -d --name random-file-bot `
 
 Every sent file includes a refresh button. Pressing it edits the same message with another random file when Telegram allows that media edit.
 
+## Inline Mode
+
+Enable inline mode for the bot in BotFather first. Then typing `@YourBotUsername` with no query text shows one result: `Send a random video from vault`. Selecting it sends a random cached video from the indexed vault.
+
+Inline usage uses the same request limit as `/random` and refresh clicks.
+
 ## Owner and Sudo Commands
 
 The owner is configured with `OWNER_ID`. Sudo users have the same bot-management permissions.
