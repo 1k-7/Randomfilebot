@@ -178,8 +178,13 @@ def is_block_error(error: RPCError) -> bool:
     text = str(error).upper()
     return (
         "blocked" in name
+        or "forbidden" in name
         or "peeridinvalid" in name
+        or "403" in text
+        or "FORBIDDEN" in text
         or "USER_IS_BLOCKED" in text
+        or "BOT_BLOCKED" in text
+        or "BOT WAS BLOCKED" in text
         or "PEER_ID_INVALID" in text
     )
 
@@ -434,6 +439,23 @@ def user_limit_text(rt: BotRuntime, user_id: int) -> str:
     return str(rt.config.request_limit + rt.db.bonus_requests(user_id))
 
 
+def spoiler_enabled_for(rt: BotRuntime, user_id: int | None) -> bool:
+    return rt.db.spoiler_mode_enabled() or bool(user_id and rt.db.user_spoiler_enabled(user_id))
+
+
+def file_send_kwargs(rt: BotRuntime) -> dict[str, object]:
+    kwargs: dict[str, object] = {}
+    if rt.db.protect_content_enabled():
+        kwargs["protect_content"] = True
+    return kwargs
+
+
+def record_successful_file_request(rt: BotRuntime, user_id: int, file_db_id: int, event_type: str) -> None:
+    rt.db.record_file_event(user_id, file_db_id, event_type)
+    if event_type in {"request", "refresh"}:
+        rt.db.fulfill_referral(user_id)
+
+
 def cancel_delete_task(rt: BotRuntime, chat_id: int, message_id: int) -> None:
     task = rt.delete_tasks.pop((chat_id, message_id), None)
     if task and not task.done():
@@ -625,8 +647,14 @@ async def send_random_file_message(
         return
     if rt.db.single_file_mode_enabled():
         await reset_previous_active_file_message(client, rt, user)
-    sent = await send_file_message(client, rt, message.chat.id, item)
-    rt.db.record_file_event(user.id, item.id, event_type)
+    try:
+        sent = await send_file_message(client, rt, message.chat.id, item, user_id=user.id)
+    except RPCError as error:
+        if is_block_error(error):
+            rt.db.mark_user_blocked(user.id, True)
+            return
+        raise
+    record_successful_file_request(rt, user.id, item.id, event_type)
     await remember_file_message(client, rt, user, sent)
 
 
@@ -654,20 +682,28 @@ async def refresh_random_file(
     target = (int(query.message.chat.id), int(query.message.id))
     if rt.db.single_file_mode_enabled():
         await reset_previous_active_file_message(client, rt, user, skip=target)
-    try:
-        edited = await edit_message_media(rt, query, item)
-        rt.db.record_file_event(user.id, item.id, event_type)
-        await remember_file_message(client, rt, user, edited)
-        return
-    except (RPCError, ValueError):
+    if not rt.db.protect_content_enabled():
         try:
-            cancel_delete_task(rt, int(query.message.chat.id), int(query.message.id))
-            await query.message.delete()
-        except RPCError:
+            edited = await edit_message_media(rt, query, item, user_id=user.id)
+            record_successful_file_request(rt, user.id, item.id, event_type)
+            await remember_file_message(client, rt, user, edited)
+            return
+        except (RPCError, ValueError):
             pass
-        sent = await send_file_message(client, rt, query.message.chat.id, item)
-        rt.db.record_file_event(user.id, item.id, event_type)
-        await remember_file_message(client, rt, user, sent)
+    try:
+        cancel_delete_task(rt, int(query.message.chat.id), int(query.message.id))
+        await query.message.delete()
+    except RPCError:
+        pass
+    try:
+        sent = await send_file_message(client, rt, query.message.chat.id, item, user_id=user.id)
+    except RPCError as error:
+        if is_block_error(error):
+            rt.db.mark_user_blocked(user.id, True)
+            return
+        raise
+    record_successful_file_request(rt, user.id, item.id, event_type)
+    await remember_file_message(client, rt, user, sent)
 
 
 def file_caption(item: IndexedFile) -> str:
@@ -698,13 +734,19 @@ async def edit_query_text_or_caption(
         )
 
 
-async def edit_message_media(rt: BotRuntime, query: CallbackQuery, item: IndexedFile) -> Message:
+async def edit_message_media(
+    rt: BotRuntime,
+    query: CallbackQuery,
+    item: IndexedFile,
+    *,
+    user_id: int | None,
+) -> Message:
     message = query.message
     if not message:
         raise ValueError("No message attached to callback query.")
     try:
         edited = await message.edit_media(
-            media=input_media_for(rt, item),
+            media=input_media_for(rt, item, user_id=user_id),
             reply_markup=refresh_keyboard(item.id),
         )
         return edited or message
@@ -714,15 +756,15 @@ async def edit_message_media(rt: BotRuntime, query: CallbackQuery, item: Indexed
             raise
         corrected = correct_file_type(rt, item, corrected_type)
         edited = await message.edit_media(
-            media=input_media_for(rt, corrected),
+            media=input_media_for(rt, corrected, user_id=user_id),
             reply_markup=refresh_keyboard(corrected.id),
         )
         return edited or message
 
 
-def input_media_for(rt: BotRuntime, item: IndexedFile):
+def input_media_for(rt: BotRuntime, item: IndexedFile, *, user_id: int | None):
     kwargs = {"media": item.file_id, "caption": file_caption(item), "parse_mode": ParseMode.HTML}
-    if rt.db.spoiler_mode_enabled() and item.file_type in {"photo", "video", "animation"}:
+    if spoiler_enabled_for(rt, user_id) and item.file_type in {"photo", "video", "animation"}:
         kwargs["has_spoiler"] = True
     if item.file_type == "photo":
         return InputMediaPhoto(**kwargs)
@@ -735,14 +777,22 @@ def input_media_for(rt: BotRuntime, item: IndexedFile):
     return InputMediaDocument(**kwargs)
 
 
-async def send_file_message(client: Client, rt: BotRuntime, chat_id: int, item: IndexedFile) -> Message:
+async def send_file_message(
+    client: Client,
+    rt: BotRuntime,
+    chat_id: int,
+    item: IndexedFile,
+    *,
+    user_id: int | None,
+) -> Message:
     kwargs = {
         "chat_id": chat_id,
         "caption": file_caption(item),
         "parse_mode": ParseMode.HTML,
         "reply_markup": refresh_keyboard(item.id),
+        **file_send_kwargs(rt),
     }
-    if rt.db.spoiler_mode_enabled():
+    if spoiler_enabled_for(rt, user_id):
         if item.file_type == "photo":
             return await client.send_photo(photo=item.file_id, has_spoiler=True, **kwargs)
         if item.file_type == "video":
@@ -1330,56 +1380,47 @@ async def send_full_users_export(client: Client, rt: BotRuntime, message: Messag
 
 def admin_help_pages(rt: BotRuntime) -> list[str]:
     single_mode = "on" if rt.db.single_file_mode_enabled() else "off"
-    spoiler_mode = "on" if rt.db.spoiler_mode_enabled() else "off"
+    global_spoiler = "on" if rt.db.spoiler_mode_enabled() else "off"
+    protect = "on" if rt.db.protect_content_enabled() else "off"
     maintenance = "on" if rt.db.maintenance_mode_enabled() else "off"
     referrals = "on" if rt.db.referral_mode_enabled() else "off"
     delete_timer = format_duration(rt.db.delete_timer_seconds())
     return [
         (
-            "<b>Admin manual 1/4</b>\n\n"
-            "<b>User flow</b>\n"
-            "- /start - show the draw prompt.\n"
-            "- /random or /get - send a random vault file.\n"
-            "- /stats - show your usage.\n"
-            "- /refer - create your referral link.\n"
-            "- /redeem &lt;code&gt; - redeem a promo code.\n"
-            "- Inline: <code>@YourBotUsername</code> - send a random cached video."
+            "<b>Admin help 1/2</b>\n\n"
+            "<b>User commands</b>\n"
+            "- /random or /get - draw a file. Example: <code>/random</code>\n"
+            "- /stats - usage, bonus requests, referrals. Example: <code>/stats</code>\n"
+            "- /spoiler [on|off|status] - personal spoiler preference. Example: <code>/spoiler on</code>\n"
+            "- /refer - create a referral link. Valid after the referred user completes fsub and gets a file.\n"
+            "- /redeem &lt;code&gt; - redeem bonus requests. Example: <code>/redeem ABC123</code>\n\n"
+            "<b>Files and backups</b>\n"
+            "- /addfile &lt;file_id&gt; [label] - index a file. Example: <code>/addfile document FILE_ID Movie</code>\n"
+            "- /addfile as a reply to media - index replied media.\n"
+            "- /importjson [replace] - import file IDs. Example: <code>/importjson replace</code>\n"
+            "- /importdb - restore exported SQLite DB. Example: reply to DB with <code>/importdb</code>\n"
+            "- /exportdb - export full SQLite DB.\n"
+            "- /delfile &lt;file_id&gt;, /files - remove/list indexed files."
         ),
         (
-            "<b>Admin manual 2/4</b>\n\n"
-            "<b>Vault and backups</b>\n"
-            "- /addfile &lt;file_id&gt; [label] - index a file.\n"
-            "- /addfile &lt;type&gt; &lt;file_id&gt; [label] - type: document, photo, video, audio, animation.\n"
-            "- Reply to media with /addfile - index that media.\n"
-            "- /importjson [replace] - import file IDs from JSON.\n"
-            "- /importdb - restore an exported SQLite DB.\n"
-            "- /exportdb - send a full SQLite backup.\n"
-            "- /delfile &lt;file_id&gt; - remove a file.\n"
-            "- /files - indexed file summary."
-        ),
-        (
-            "<b>Admin manual 3/4</b>\n\n"
+            "<b>Admin help 2/2</b>\n\n"
             "<b>Access and users</b>\n"
-            "- /addfsub &lt;chat_id|@username&gt; [invite_link] [title] - require membership.\n"
-            "- /addreqfsub &lt;chat_id|@username&gt; [invite_link] [title] - require join request.\n"
-            "- /delfsub &lt;chat_id|@username&gt; - remove force-sub.\n"
-            "- /addsudo, /delsudo, /sudos - manage sudo users.\n"
-            "- /addpriv &lt;user_id&gt;, /delpriv &lt;user_id&gt;, /privs - unlimited users with no admin rights.\n"
-            "- /users [-full] [-txt|-json] - recent users or full export.\n"
-            "- /user &lt;user_id&gt;, /blocked, /membership, /broadcast &lt;text&gt;."
-        ),
-        (
-            "<b>Admin manual 4/4</b>\n\n"
+            "- /addfsub &lt;chat_id|@username&gt; [invite_link] [title]. Example: <code>/addfsub @channel</code>\n"
+            "- /addreqfsub &lt;chat_id|@username&gt; [invite_link] [title]. Example: <code>/addreqfsub @requests</code>\n"
+            "- /delfsub &lt;chat_id|@username&gt;, /fsubs - remove/list force-sub.\n"
+            "- /addsudo &lt;user_id&gt;, /delsudo &lt;user_id&gt;, /sudos - manage admins.\n"
+            "- /addpriv &lt;user_id&gt;, /delpriv &lt;user_id&gt;, /privs - unlimited non-admin users.\n"
+            "- /users [-full] [-txt|-json]. Examples: <code>/users</code>, <code>/users -full -json</code>\n"
+            "- /user &lt;user_id&gt;, /blocked, /membership, /broadcast &lt;text&gt;.\n\n"
             "<b>Modes and profile</b>\n"
             f"- /maintenance [on|off|status] - dead mode for non-admins. Current: <b>{maintenance}</b>.\n"
-            f"- /spoiler [on|off|status] - spoiler all photo/video/animation media. Current: <b>{spoiler_mode}</b>.\n"
+            f"- /globalspoiler [on|off|status] - global spoiler media. Current: <b>{global_spoiler}</b>.\n"
+            f"- /protect [on|off|status] - prevent forwarding/saving sent files. Current: <b>{protect}</b>.\n"
             f"- /singlemode [on|off|status] - one active file message. Current: <b>{single_mode}</b>.\n"
-            f"- /deletetimer &lt;time|off&gt; - reset/delete file messages. Current: <b>{delete_timer}</b>.\n"
-            f"- /referrals [on|off|status] [bonus n] - referrals. Current: <b>{referrals}</b>, bonus <b>{rt.db.referral_bonus()}</b>.\n"
-            "- /promo &lt;bonus&gt; &lt;max_uses&gt; [expiry] [code] - create promo code.\n"
-            "- /setbot &lt;name|about|description|username&gt; &lt;text&gt; - update bot profile.\n"
-            "- /delbot &lt;about|description|username|botpic&gt; - clear profile field.\n"
-            "- /setbotpic - reply to a photo to set bot picture."
+            f"- /deletetimer &lt;time|off&gt; - reset/delete messages. Current: <b>{delete_timer}</b>.\n"
+            f"- /referrals [on|off|status] [bonus n] - current <b>{referrals}</b>, bonus <b>{rt.db.referral_bonus()}</b>. Example: <code>/referrals on bonus 5</code>\n"
+            "- /promo &lt;bonus&gt; &lt;max_uses&gt; [expiry] [code]. Example: <code>/promo 10 100 2d LAUNCH</code>\n"
+            "- /setbot &lt;name|about|description|username&gt; &lt;text&gt;, /delbot &lt;field&gt;, /setbotpic."
         ),
     ]
 
@@ -1406,6 +1447,7 @@ def user_help_text(rt: BotRuntime) -> str:
         "<b>Commands</b>\n"
         "- /random or /get - draw a file\n"
         "- /stats - see your usage\n"
+        "- /spoiler [on|off|status] - toggle spoiler media for yourself\n"
         "- /refer - get your referral link\n"
         "- /redeem &lt;code&gt; - add promo requests\n"
         "- /help - open this note\n\n"
@@ -1552,10 +1594,10 @@ def build_client(config: Config, db: Database) -> Client:
             [
                 InlineQueryResultCachedVideo(
                     video_file_id=item.file_id,
-                    title="Send a random video from vault",
+                    title="Mystery vault draw",
                     id=f"vault-video-{item.id}",
-                    description=item.label or "Tap to send a random vault video.",
-                    caption=file_caption(item),
+                    description="Tap to reveal it in chat.",
+                    caption="<b>Mystery file unlocked.</b>",
                     parse_mode=ParseMode.HTML,
                 )
             ],
@@ -1668,7 +1710,8 @@ def build_client(config: Config, db: Database) -> Client:
             (
                 "<b>Your referral link</b>\n\n"
                 f"<code>{escape(link)}</code>\n\n"
-                f"Each new user who starts with it adds <b>{rt.db.referral_bonus()}</b> bonus requests."
+                "A referral counts after the new user completes force-sub and receives a file. "
+                f"Each valid referral adds <b>{rt.db.referral_bonus()}</b> bonus requests."
             ),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -1697,23 +1740,75 @@ def build_client(config: Config, db: Database) -> Client:
     @app.on_message(filters.command("spoiler"))
     async def spoiler_command(client: Client, message: Message) -> None:
         await track_user(rt, message.from_user)
-        if not await require_sudo(rt, message):
+        if not await enforce_maintenance_message(rt, message):
+            return
+        if not message.from_user:
             return
         args = command_args(message)
-        current = rt.db.spoiler_mode_enabled()
+        current = rt.db.user_spoiler_enabled(message.from_user.id)
         enabled, status_only = parse_bool_arg(args, current)
         if enabled is None:
             await message.reply_text("Use /spoiler, /spoiler on, /spoiler off, or /spoiler status.")
             return
         if status_only:
             await message.reply_text(
-                f"<b>Spoiler mode</b>\n\nCurrent state: <b>{'on' if current else 'off'}</b>.",
+                f"<b>Your spoiler mode</b>\n\nCurrent state: <b>{'on' if current else 'off'}</b>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        rt.db.set_user_spoiler(message.from_user.id, enabled)
+        await message.reply_text(
+            f"<b>Your spoiler mode updated.</b>\n\nState: <b>{'on' if enabled else 'off'}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    @app.on_message(filters.command("globalspoiler"))
+    async def global_spoiler_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        args = command_args(message)
+        current = rt.db.spoiler_mode_enabled()
+        enabled, status_only = parse_bool_arg(args, current)
+        if enabled is None:
+            await message.reply_text("Use /globalspoiler, /globalspoiler on, /globalspoiler off, or /globalspoiler status.")
+            return
+        if status_only:
+            await message.reply_text(
+                f"<b>Global spoiler mode</b>\n\nCurrent state: <b>{'on' if current else 'off'}</b>.",
                 parse_mode=ParseMode.HTML,
             )
             return
         rt.db.set_spoiler_mode(enabled)
         await message.reply_text(
-            f"<b>Spoiler mode updated.</b>\n\nState: <b>{'on' if enabled else 'off'}</b>.",
+            f"<b>Global spoiler mode updated.</b>\n\nState: <b>{'on' if enabled else 'off'}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    @app.on_message(filters.command("protect"))
+    async def protect_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        args = command_args(message)
+        current = rt.db.protect_content_enabled()
+        enabled, status_only = parse_bool_arg(args, current)
+        if enabled is None:
+            await message.reply_text("Use /protect, /protect on, /protect off, or /protect status.")
+            return
+        if status_only:
+            await message.reply_text(
+                f"<b>Protect-content mode</b>\n\nCurrent state: <b>{'on' if current else 'off'}</b>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        rt.db.set_protect_content(enabled)
+        await message.reply_text(
+            (
+                "<b>Protect-content mode updated.</b>\n\n"
+                f"State: <b>{'on' if enabled else 'off'}</b>.\n"
+                "When on, new file messages are sent with Telegram forwarding/saving protection."
+            ),
             parse_mode=ParseMode.HTML,
         )
 

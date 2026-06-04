@@ -118,7 +118,17 @@ class Database:
                     referred_id INTEGER PRIMARY KEY,
                     referrer_id INTEGER NOT NULL,
                     bonus_awarded INTEGER NOT NULL,
+                    fulfilled INTEGER NOT NULL DEFAULT 0,
+                    fulfilled_at TEXT,
                     created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id INTEGER NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, key)
                 );
 
                 CREATE TABLE IF NOT EXISTS promo_codes (
@@ -168,6 +178,8 @@ class Database:
                     ON indexed_files (file_type, id);
                 CREATE INDEX IF NOT EXISTS idx_referrals_referrer
                     ON referrals (referrer_id);
+                CREATE INDEX IF NOT EXISTS idx_referrals_pending
+                    ON referrals (referred_id, fulfilled);
                 CREATE INDEX IF NOT EXISTS idx_promo_expires
                     ON promo_codes (expires_at);
                 """
@@ -177,6 +189,21 @@ class Database:
                 "force_sub_chats",
                 "mode",
                 "TEXT NOT NULL DEFAULT 'member'",
+            )
+            self._ensure_column(
+                conn,
+                "referrals",
+                "fulfilled",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                conn,
+                "referrals",
+                "fulfilled_at",
+                "TEXT",
+            )
+            conn.execute(
+                "UPDATE referrals SET fulfilled = 1 WHERE bonus_awarded > 0 AND fulfilled = 0"
             )
             conn.execute(
                 """
@@ -274,6 +301,39 @@ class Database:
 
     def set_spoiler_mode(self, enabled: bool) -> None:
         self.set_setting("spoiler_mode", "1" if enabled else "0")
+
+    def protect_content_enabled(self) -> bool:
+        return self.get_setting("protect_content_mode", "0") == "1"
+
+    def set_protect_content(self, enabled: bool) -> None:
+        self.set_setting("protect_content_mode", "1" if enabled else "0")
+
+    def get_user_setting(self, user_id: int, key: str, default: str | None = None) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM user_settings WHERE user_id = ? AND key = ?",
+                (user_id, key),
+            ).fetchone()
+            return str(row["value"]) if row else default
+
+    def set_user_setting(self, user_id: int, key: str, value: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_settings (user_id, key, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, key, value, to_db_time()),
+            )
+
+    def user_spoiler_enabled(self, user_id: int) -> bool:
+        return self.get_user_setting(user_id, "spoiler_mode", "0") == "1"
+
+    def set_user_spoiler(self, user_id: int, enabled: bool) -> None:
+        self.set_user_setting(user_id, "spoiler_mode", "1" if enabled else "0")
 
     def referral_mode_enabled(self) -> bool:
         return self.get_setting("referral_mode", "0") == "1"
@@ -376,10 +436,21 @@ class Database:
             )
 
     def mark_user_blocked(self, user_id: int, blocked: bool = True) -> None:
+        now = to_db_time()
         with self.connect() as conn:
             conn.execute(
+                """
+                INSERT OR IGNORE INTO users (
+                    user_id, username, first_name, last_name, is_bot, is_blocked,
+                    first_seen, last_seen
+                )
+                VALUES (?, NULL, NULL, NULL, 0, ?, ?, ?)
+                """,
+                (user_id, int(blocked), now, now),
+            )
+            conn.execute(
                 "UPDATE users SET is_blocked = ?, last_seen = ? WHERE user_id = ?",
-                (int(blocked), to_db_time(), user_id),
+                (int(blocked), now, user_id),
             )
 
     def ensure_user_record(self, user_id: int) -> None:
@@ -673,25 +744,53 @@ class Database:
                 ),
             )
 
-    def create_referral(self, referrer_id: int, referred_id: int) -> int:
+    def create_referral(self, referrer_id: int, referred_id: int) -> bool:
         if referrer_id == referred_id or not self.referral_mode_enabled():
-            return 0
-        bonus = self.referral_bonus()
-        if bonus <= 0:
-            return 0
+            return False
         with self.connect() as conn:
             existing = conn.execute(
                 "SELECT 1 FROM referrals WHERE referred_id = ?",
                 (referred_id,),
             ).fetchone()
             if existing:
-                return 0
+                return False
             conn.execute(
                 """
                 INSERT INTO referrals (referred_id, referrer_id, bonus_awarded, created_at)
                 VALUES (?, ?, ?, ?)
                 """,
-                (referred_id, referrer_id, bonus, to_db_time()),
+                (referred_id, referrer_id, 0, to_db_time()),
+            )
+            return True
+
+    def fulfill_referral(self, referred_id: int) -> int:
+        if not self.referral_mode_enabled():
+            return 0
+        bonus = self.referral_bonus()
+        if bonus <= 0:
+            return 0
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT referrer_id
+                FROM referrals
+                WHERE referred_id = ? AND fulfilled = 0
+                """,
+                (referred_id,),
+            ).fetchone()
+            if not row:
+                return 0
+            referrer_id = int(row["referrer_id"])
+            now = to_db_time()
+            conn.execute(
+                """
+                UPDATE referrals
+                SET fulfilled = 1,
+                    bonus_awarded = ?,
+                    fulfilled_at = ?
+                WHERE referred_id = ? AND fulfilled = 0
+                """,
+                (bonus, now, referred_id),
             )
             conn.execute(
                 """
@@ -701,14 +800,14 @@ class Database:
                     bonus_requests = bonus_requests + excluded.bonus_requests,
                     updated_at = excluded.updated_at
                 """,
-                (referrer_id, bonus, to_db_time()),
+                (referrer_id, bonus, now),
             )
             return bonus
 
     def referral_count(self, referrer_id: int) -> int:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS count FROM referrals WHERE referrer_id = ?",
+                "SELECT COUNT(*) AS count FROM referrals WHERE referrer_id = ? AND fulfilled = 1",
                 (referrer_id,),
             ).fetchone()
             return int(row["count"])
@@ -952,6 +1051,7 @@ class Database:
                 LEFT JOIN (
                     SELECT referrer_id, COUNT(*) AS referrals
                     FROM referrals
+                    WHERE fulfilled = 1
                     GROUP BY referrer_id
                 ) r ON r.referrer_id = u.user_id
                 ORDER BY u.first_seen DESC

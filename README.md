@@ -61,6 +61,7 @@ docker run -d --name random-file-bot `
 - `/start` - open the bot and request a random file.
 - `/random` or `/get` - request a random file.
 - `/stats` - show your usage stats.
+- `/spoiler [on|off|status]` - toggle spoiler effect for files sent to you.
 - `/refer` - create your referral link when referrals are enabled.
 - `/redeem <code>` - redeem a promo code for extra requests.
 - `/help` - show user help, or the admin manual for owner/sudo users.
@@ -69,7 +70,7 @@ Every sent file includes a refresh button. Pressing it edits the same message wi
 
 ## Inline Mode
 
-Enable inline mode for the bot in BotFather first. Then typing `@YourBotUsername` with no query text shows one result: `Send a random video from vault`. Selecting it sends a random cached video from the indexed vault.
+Enable inline mode for the bot in BotFather first. Then typing `@YourBotUsername` with no query text shows one generic mystery result. Selecting it sends a random cached video from the indexed vault without exposing the bot's stored label or caption in the inline result.
 
 Inline usage uses the same request limit as `/random` and refresh clicks.
 
@@ -82,7 +83,8 @@ The owner is configured with `OWNER_ID`. Sudo users have the same bot-management
 - `/exportdb` - export the full SQLite database for migration or backup.
 - `/importdb` - import a SQLite database previously exported by `/exportdb`.
 - `/maintenance [on|off|status]` - make the bot silently unavailable to non-admin users while owner/sudo users can keep operating.
-- `/spoiler [on|off|status]` - send supported media with Telegram's spoiler effect.
+- `/globalspoiler [on|off|status]` - send supported media with Telegram's spoiler effect for everyone.
+- `/protect [on|off|status]` - send new file messages with Telegram forwarding/saving protection.
 - `/singlemode [on|off|status]` - toggle one-active-file-message mode per user.
 - `/deletetimer <time|off>` - reset/delete non-admin file messages after a custom interval. Examples: `/deletetimer 30s`, `/deletetimer 10m`, `/deletetimer 1h`, `/deletetimer off`.
 - `/referrals [on|off|status] [bonus n]` - toggle referral rewards and set how many bonus requests each accepted referral adds.
@@ -121,7 +123,7 @@ The owner is configured with `OWNER_ID`. Sudo users have the same bot-management
 
 `/maintenance on` is meant for backups, imports, and operational work. While it is enabled, non-admin users get no bot responses; owner and sudo users can still use admin commands such as `/exportdb`, `/importdb`, and `/maintenance off`.
 
-Referral and promo bonuses are additive on top of `REQUEST_LIMIT`. Sudo users and `/addpriv` users are unlimited but still counted in user statistics.
+Referral and promo bonuses are additive on top of `REQUEST_LIMIT`. A referral is counted only after the referred user completes force-sub and receives at least one file from the bot. Sudo users and `/addpriv` users are unlimited but still counted in user statistics.
 
 ## Force Subscribe Notes
 
