@@ -6,8 +6,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
-from telegram import User
-
 from .models import ForceSubChat, IndexedFile, MembershipEvent, UserStats
 
 
@@ -117,7 +115,7 @@ class Database:
                 (owner_id, owner_id, to_db_time()),
             )
 
-    def upsert_user(self, user: User, *, blocked: bool = False) -> None:
+    def upsert_user(self, user, *, blocked: bool = False) -> None:
         now = to_db_time()
         with self.connect() as conn:
             conn.execute(

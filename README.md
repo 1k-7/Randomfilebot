@@ -1,11 +1,12 @@
 # Random File Telegram Bot
 
-A Telegram bot that sends a random indexed file by Telegram `file_id`, supports refresh buttons, force-subscribe channels/chats, sudo admins, rate limiting, and usage analytics.
+A Telegram bot built on Pyroblack/Pyrogram that sends a random indexed file by Telegram `file_id`, supports refresh buttons, force-subscribe channels/chats, sudo admins, rate limiting, and usage analytics.
 
 ## Setup
 
 1. Create a bot with BotFather and copy its token.
-2. Install dependencies:
+2. Create Telegram API credentials at `https://my.telegram.org` and copy your `API_ID` and `API_HASH`.
+3. Install dependencies:
 
    ```powershell
    python -m venv .venv
@@ -13,15 +14,19 @@ A Telegram bot that sends a random indexed file by Telegram `file_id`, supports 
    pip install -r requirements.txt
    ```
 
-3. Copy `.env.example` to `.env` and set:
+4. Copy `.env.example` to `.env` and set:
 
    - `BOT_TOKEN`: your Telegram bot token.
+   - `API_ID`: your Telegram API ID from `my.telegram.org`.
+   - `API_HASH`: your Telegram API hash from `my.telegram.org`.
    - `OWNER_ID`: your Telegram numeric user ID.
    - `DATABASE_PATH`: optional SQLite path.
+   - `SESSION_NAME`: optional Pyroblack session name.
+   - `SESSION_WORKDIR`: optional directory for the Pyroblack session file.
    - `REQUEST_LIMIT`: optional, defaults to `30`.
    - `REQUEST_WINDOW_MINUTES`: optional, defaults to `60`.
 
-4. Run the bot:
+5. Run the bot:
 
    ```powershell
    python -m random_file_bot
@@ -35,11 +40,13 @@ Build the image:
 docker build -t random-file-bot .
 ```
 
-Run it with your token and owner ID:
+Run it with your token, API credentials, and owner ID:
 
 ```powershell
 docker run -d --name random-file-bot `
   -e BOT_TOKEN=123456:replace-me `
+  -e API_ID=123456 `
+  -e API_HASH=replace-me `
   -e OWNER_ID=123456789 `
   -v random-file-bot-data:/data `
   random-file-bot
