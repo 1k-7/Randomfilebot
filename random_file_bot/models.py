@@ -19,6 +19,7 @@ class ForceSubChat:
     chat_id: str
     title: str | None
     invite_link: str | None
+    mode: str
     enabled: bool
     created_at: datetime
 

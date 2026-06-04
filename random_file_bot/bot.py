@@ -37,6 +37,8 @@ from .models import ForceSubChat, IndexedFile, UserStats
 
 
 REFRESH_CALLBACK = "refresh_file"
+FSUB_MEMBER_MODE = "member"
+FSUB_REQUEST_MODE = "request"
 SUPPORTED_FILE_TYPES = {"document", "photo", "video", "audio", "animation"}
 PYROGRAM_FILE_TYPE_MAP = {
     FileType.PHOTO: "photo",
@@ -53,6 +55,7 @@ class BotRuntime:
     def __init__(self, config: Config, db: Database) -> None:
         self.config = config
         self.db = db
+        self.delete_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
 
 def sleek_title(user_name: str | None) -> str:
@@ -70,12 +73,18 @@ def refresh_keyboard(file_db_id: int | None = None) -> InlineKeyboardMarkup:
     )
 
 
+def start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Draw a file", callback_data=REFRESH_CALLBACK)]]
+    )
+
+
 def force_sub_keyboard(chats: list[ForceSubChat]) -> InlineKeyboardMarkup:
     buttons: list[list[InlineKeyboardButton]] = []
     for chat in chats:
         title = chat.title or str(chat.chat_id)
         if chat.invite_link:
-            buttons.append([InlineKeyboardButton(f"Join {short_text(title, 48)}", url=chat.invite_link)])
+            buttons.append([InlineKeyboardButton(short_text(title, 48), url=chat.invite_link)])
     buttons.append([InlineKeyboardButton("I joined", callback_data=REFRESH_CALLBACK)])
     return InlineKeyboardMarkup(buttons)
 
@@ -200,10 +209,14 @@ async def require_sudo(rt: BotRuntime, message: Message) -> bool:
     if not user:
         await message.reply_text("I can only accept admin commands from a visible user account.")
         return False
-    if user.id == rt.config.owner_id or rt.db.is_sudo(user.id):
+    if is_sudo_user(rt, user.id):
         return True
     await message.reply_text("This panel is only for the owner and sudo users.")
     return False
+
+
+def is_sudo_user(rt: BotRuntime, user_id: int) -> bool:
+    return user_id == rt.config.owner_id or rt.db.is_sudo(user_id)
 
 
 async def track_user(rt: BotRuntime, user) -> None:
@@ -218,17 +231,28 @@ async def missing_force_sub_chats(
 ) -> list[ForceSubChat]:
     missing: list[ForceSubChat] = []
     for chat in rt.db.list_force_sub_chats():
-        try:
-            member = await client.get_chat_member(chat_ref(chat.chat_id), user_id)
-            status = status_value(member.status)
-            if status in MEMBER_STATUSES:
-                continue
-            if status == "restricted" and getattr(member, "is_member", False):
-                continue
-            missing.append(chat)
-        except RPCError:
-            missing.append(chat)
+        if await force_sub_chat_fulfilled(client, rt, chat, user_id):
+            continue
+        missing.append(chat)
     return missing
+
+
+async def force_sub_chat_fulfilled(
+    client: Client,
+    rt: BotRuntime,
+    chat: ForceSubChat,
+    user_id: int,
+) -> bool:
+    try:
+        member = await client.get_chat_member(chat_ref(chat.chat_id), user_id)
+        status = status_value(member.status)
+        if status in MEMBER_STATUSES:
+            return True
+        if status == "restricted" and getattr(member, "is_member", False):
+            return True
+    except RPCError:
+        pass
+    return chat.mode == FSUB_REQUEST_MODE and rt.db.has_join_request(user_id, chat.chat_id)
 
 
 async def enforce_force_sub_message(client: Client, rt: BotRuntime, message: Message) -> bool:
@@ -262,13 +286,13 @@ async def enforce_force_sub_query(client: Client, rt: BotRuntime, query: Callbac
 
 
 def force_sub_text(missing: list[ForceSubChat]) -> str:
+    request_note = any(chat.mode == FSUB_REQUEST_MODE for chat in missing)
     text = (
         "<b>One step before the vault opens.</b>\n\n"
-        "Join the required chat first, then tap <b>I joined</b> to continue."
+        "Use the required chat buttons below, then tap <b>I joined</b> to continue."
     )
-    required = "\n".join(f"- {escape(chat.title or chat.chat_id)}" for chat in missing)
-    if required:
-        text += f"\n\n<b>Required</b>\n{required}"
+    if request_note:
+        text += "\n\nFor request-only chats, sending the join request is enough."
     return text
 
 
@@ -344,6 +368,145 @@ def rate_limit_text(rt: BotRuntime) -> str:
     )
 
 
+def cancel_delete_task(rt: BotRuntime, chat_id: int, message_id: int) -> None:
+    task = rt.delete_tasks.pop((chat_id, message_id), None)
+    if task and not task.done():
+        task.cancel()
+
+
+def cancel_all_delete_tasks(rt: BotRuntime) -> None:
+    for task in rt.delete_tasks.values():
+        if not task.done():
+            task.cancel()
+    rt.delete_tasks.clear()
+
+
+async def reset_file_message_to_start(
+    client: Client,
+    *,
+    user_name: str | None,
+    chat_id: int,
+    message_id: int,
+) -> bool:
+    try:
+        await client.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=sleek_title(user_name),
+            parse_mode=ParseMode.HTML,
+            reply_markup=start_keyboard(),
+            disable_web_page_preview=True,
+        )
+        return True
+    except RPCError:
+        pass
+
+    try:
+        await client.delete_messages(chat_id=chat_id, message_ids=message_id)
+        return True
+    except RPCError:
+        return False
+
+
+async def reset_previous_active_file_message(
+    client: Client,
+    rt: BotRuntime,
+    user,
+    *,
+    skip: tuple[int, int] | None = None,
+) -> None:
+    previous = rt.db.get_active_file_message(user.id)
+    if not previous or previous == skip:
+        return
+    chat_id, message_id = previous
+    cancel_delete_task(rt, chat_id, message_id)
+    await reset_file_message_to_start(
+        client,
+        user_name=getattr(user, "first_name", None),
+        chat_id=chat_id,
+        message_id=message_id,
+    )
+    rt.db.clear_active_file_message(user.id, chat_id, message_id)
+
+
+async def remember_file_message(
+    client: Client,
+    rt: BotRuntime,
+    user,
+    message: Message,
+) -> None:
+    chat_id = int(message.chat.id)
+    message_id = int(message.id)
+    rt.db.set_active_file_message(user.id, chat_id, message_id)
+    schedule_file_delete_timer(
+        client,
+        rt,
+        user_id=user.id,
+        user_name=getattr(user, "first_name", None),
+        chat_id=chat_id,
+        message_id=message_id,
+    )
+
+
+def schedule_file_delete_timer(
+    client: Client,
+    rt: BotRuntime,
+    *,
+    user_id: int,
+    user_name: str | None,
+    chat_id: int,
+    message_id: int,
+) -> None:
+    seconds = rt.db.delete_timer_seconds()
+    cancel_delete_task(rt, chat_id, message_id)
+    if seconds <= 0 or is_sudo_user(rt, user_id):
+        return
+    rt.delete_tasks[(chat_id, message_id)] = asyncio.create_task(
+        expire_file_message_after(
+            client,
+            rt,
+            user_id=user_id,
+            user_name=user_name,
+            chat_id=chat_id,
+            message_id=message_id,
+            seconds=seconds,
+        )
+    )
+
+
+async def expire_file_message_after(
+    client: Client,
+    rt: BotRuntime,
+    *,
+    user_id: int,
+    user_name: str | None,
+    chat_id: int,
+    message_id: int,
+    seconds: int,
+) -> None:
+    key = (chat_id, message_id)
+    try:
+        await asyncio.sleep(seconds)
+        if rt.db.delete_timer_seconds() <= 0 or is_sudo_user(rt, user_id):
+            return
+        if rt.db.single_file_mode_enabled() and rt.db.get_active_file_message(user_id) != key:
+            return
+        await reset_file_message_to_start(
+            client,
+            user_name=user_name,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+        rt.db.clear_active_file_message(user_id, chat_id, message_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("File delete timer failed")
+    finally:
+        if rt.delete_tasks.get(key) is asyncio.current_task():
+            rt.delete_tasks.pop(key, None)
+
+
 async def send_random_file_message(
     client: Client,
     rt: BotRuntime,
@@ -361,8 +524,11 @@ async def send_random_file_message(
             parse_mode=ParseMode.HTML,
         )
         return
-    await send_file_message(client, message.chat.id, item)
+    if rt.db.single_file_mode_enabled():
+        await reset_previous_active_file_message(client, rt, user)
+    sent = await send_file_message(client, message.chat.id, item)
     rt.db.record_file_event(user.id, item.id, event_type)
+    await remember_file_message(client, rt, user, sent)
 
 
 async def refresh_random_file(
@@ -386,17 +552,23 @@ async def refresh_random_file(
         )
         return
     await query.answer("Drawing another file...")
+    target = (int(query.message.chat.id), int(query.message.id))
+    if rt.db.single_file_mode_enabled():
+        await reset_previous_active_file_message(client, rt, user, skip=target)
     try:
-        await edit_message_media(rt, query, item)
+        edited = await edit_message_media(rt, query, item)
         rt.db.record_file_event(user.id, item.id, event_type)
+        await remember_file_message(client, rt, user, edited)
         return
     except (RPCError, ValueError):
         try:
+            cancel_delete_task(rt, int(query.message.chat.id), int(query.message.id))
             await query.message.delete()
         except RPCError:
             pass
-        await send_file_message(client, query.message.chat.id, item)
+        sent = await send_file_message(client, query.message.chat.id, item)
         rt.db.record_file_event(user.id, item.id, event_type)
+        await remember_file_message(client, rt, user, sent)
 
 
 def file_caption(item: IndexedFile) -> str:
@@ -427,24 +599,26 @@ async def edit_query_text_or_caption(
         )
 
 
-async def edit_message_media(rt: BotRuntime, query: CallbackQuery, item: IndexedFile) -> None:
+async def edit_message_media(rt: BotRuntime, query: CallbackQuery, item: IndexedFile) -> Message:
     message = query.message
     if not message:
-        return
+        raise ValueError("No message attached to callback query.")
     try:
-        await message.edit_media(
+        edited = await message.edit_media(
             media=input_media_for(item),
             reply_markup=refresh_keyboard(item.id),
         )
+        return edited or message
     except ValueError as error:
         corrected_type = file_type_from_mismatch(error) or detect_file_type(item.file_id, item.file_type)
         if corrected_type == item.file_type:
             raise
         corrected = correct_file_type(rt, item, corrected_type)
-        await message.edit_media(
+        edited = await message.edit_media(
             media=input_media_for(corrected),
             reply_markup=refresh_keyboard(corrected.id),
         )
+        return edited or message
 
 
 def input_media_for(item: IndexedFile):
@@ -460,14 +634,141 @@ def input_media_for(item: IndexedFile):
     return InputMediaDocument(**kwargs)
 
 
-async def send_file_message(client: Client, chat_id: int, item: IndexedFile) -> None:
-    await client.send_cached_media(
+async def send_file_message(client: Client, chat_id: int, item: IndexedFile) -> Message:
+    return await client.send_cached_media(
         chat_id=chat_id,
         file_id=item.file_id,
         caption=file_caption(item),
         parse_mode=ParseMode.HTML,
         reply_markup=refresh_keyboard(item.id),
     )
+
+
+async def add_force_sub_command(
+    client: Client,
+    rt: BotRuntime,
+    message: Message,
+    *,
+    mode: str,
+) -> None:
+    await track_user(rt, message.from_user)
+    if not await require_sudo(rt, message):
+        return
+    args = command_args(message)
+    if not args:
+        command = "addreqfsub" if mode == FSUB_REQUEST_MODE else "addfsub"
+        await message.reply_text(f"Use /{command} <chat_id|@username> [invite_link] [title].")
+        return
+
+    chat_id = args[0]
+    tail = args[1:]
+    manual_invite = None
+    title_parts: list[str] = []
+    for part in tail:
+        maybe_link = normalize_invite_link(part)
+        if maybe_link and not manual_invite:
+            manual_invite = maybe_link
+        else:
+            title_parts.append(part)
+    custom_title = " ".join(title_parts) or None
+
+    try:
+        stored_chat_id, title, invite_link = await resolve_force_sub_chat(
+            client,
+            chat_id,
+            manual_invite=manual_invite,
+            custom_title=custom_title,
+            mode=mode,
+        )
+    except ValueError as error:
+        await message.reply_text(str(error))
+        return
+
+    rt.db.add_force_sub_chat(stored_chat_id, title, invite_link, mode)
+    mode_label = "join-request" if mode == FSUB_REQUEST_MODE else "membership"
+    await message.reply_text(
+        (
+            f"Force-sub enabled for <b>{escape(title)}</b>.\n"
+            f"Mode: <b>{mode_label}</b>.\n"
+            "Users will see it as a button, not plain text."
+        ),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def resolve_force_sub_chat(
+    client: Client,
+    chat_id: str,
+    *,
+    manual_invite: str | None,
+    custom_title: str | None,
+    mode: str,
+) -> tuple[str, str, str]:
+    try:
+        chat = await client.get_chat(chat_ref(chat_id))
+    except RPCError as error:
+        raise ValueError(
+            "I could not access that chat. Add me there as admin first, then try again."
+        ) from error
+
+    me = await client.get_me()
+    try:
+        bot_member = await client.get_chat_member(chat.id, me.id)
+    except RPCError as error:
+        raise ValueError(
+            "I could not verify my admin status in that chat. Make me admin first."
+        ) from error
+
+    bot_status = status_value(bot_member.status)
+    if bot_status not in {"administrator", "creator", "owner"}:
+        raise ValueError("I need to be an admin in that chat before it can be used for force-sub.")
+
+    title = custom_title or chat.title or chat.username or str(chat.id)
+    invite_link = manual_invite
+
+    if mode == FSUB_REQUEST_MODE and not invite_link:
+        invite_link = await create_force_sub_invite_link(
+            client,
+            chat.id,
+            creates_join_request=True,
+        )
+        if not invite_link:
+            raise ValueError(
+                "I could not create a join-request invite link. Give me invite-link permission or pass one manually."
+            )
+    elif not invite_link:
+        invite_link = getattr(chat, "invite_link", None)
+        if not invite_link and getattr(chat, "username", None):
+            invite_link = f"https://t.me/{chat.username}"
+        if not invite_link:
+            invite_link = await create_force_sub_invite_link(
+                client,
+                chat.id,
+                creates_join_request=False,
+            )
+        if not invite_link:
+            raise ValueError(
+                "I could not find or create an invite link. Give me invite-link permission or pass one manually."
+            )
+
+    return str(chat.id), title, invite_link
+
+
+async def create_force_sub_invite_link(
+    client: Client,
+    chat_id: int,
+    *,
+    creates_join_request: bool,
+) -> str | None:
+    try:
+        invite = await client.create_chat_invite_link(
+            chat_id,
+            creates_join_request=creates_join_request,
+        )
+    except RPCError:
+        return None
+    return getattr(invite, "invite_link", None)
 
 
 async def export_db_command(client: Client, rt: BotRuntime, message: Message) -> None:
@@ -736,6 +1037,105 @@ def format_dt(value) -> str:
     return value.strftime("%Y-%m-%d %H:%M UTC")
 
 
+def parse_duration_seconds(args: list[str]) -> int | None:
+    if not args:
+        return None
+    raw = "".join(args).strip().lower()
+    if raw in {"off", "disable", "disabled", "none", "0", "0s"}:
+        return 0
+    match = re.fullmatch(
+        r"(\d+)(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)?",
+        raw,
+    )
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2) or "s"
+    if unit.startswith("m"):
+        return amount * 60
+    if unit.startswith("h"):
+        return amount * 60 * 60
+    if unit.startswith("d"):
+        return amount * 24 * 60 * 60
+    return amount
+
+
+def format_duration(seconds: int) -> str:
+    if seconds <= 0:
+        return "off"
+    units = [
+        (24 * 60 * 60, "day"),
+        (60 * 60, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ]
+    for size, label in units:
+        if seconds >= size and seconds % size == 0:
+            value = seconds // size
+            suffix = "" if value == 1 else "s"
+            return f"{value} {label}{suffix}"
+    return f"{seconds} seconds"
+
+
+def user_help_text(rt: BotRuntime) -> str:
+    minutes = max(1, rt.config.request_window_seconds // 60)
+    return (
+        "<b>Vault help</b>\n\n"
+        "I pull a random file from the vault. No maze, no ceremony, just a clean draw.\n\n"
+        "<b>Commands</b>\n"
+        "- /random or /get - draw a file\n"
+        "- /stats - see your usage\n"
+        "- /help - open this note\n\n"
+        "Use the refresh button under a file for another draw. "
+        f"Limit: <b>{rt.config.request_limit}</b> files every <b>{minutes}</b> minutes."
+    )
+
+
+def admin_help_text(rt: BotRuntime) -> str:
+    single_mode = "on" if rt.db.single_file_mode_enabled() else "off"
+    delete_timer = format_duration(rt.db.delete_timer_seconds())
+    return (
+        "<b>Admin manual</b>\n\n"
+        "Everything sharp, logged, and mildly suspicious of chaos.\n\n"
+        "<b>User flow</b>\n"
+        "- /start - show the draw prompt.\n"
+        "- /random or /get - send a random vault file.\n"
+        "- /stats - show your own usage.\n"
+        "- /help - role-aware help.\n"
+        "- Inline: <code>@YourBotUsername</code> - send a random cached video.\n\n"
+        "<b>Vault files</b>\n"
+        "- /addfile &lt;file_id&gt; [label] - index a document file ID.\n"
+        "- /addfile &lt;type&gt; &lt;file_id&gt; [label] - index a typed file. "
+        "Types: document, photo, video, audio, animation.\n"
+        "- Reply to media with /addfile - index that media directly.\n"
+        "- /importjson - reply to a JSON document and import file IDs.\n"
+        "- /importjson replace - replace indexed files from JSON.\n"
+        "- /delfile &lt;file_id&gt; - remove one indexed file.\n"
+        "- /files - show total indexed files and recent entries.\n\n"
+        "<b>Access control</b>\n"
+        "- /addfsub &lt;chat_id|@username&gt; [invite_link] [title] - require chat/channel membership.\n"
+        "- /addreqfsub &lt;chat_id|@username&gt; [invite_link] [title] - require a join request.\n"
+        "- /delfsub &lt;chat_id|@username&gt; - remove a force-sub chat.\n"
+        "- /fsubs - list force-sub chats.\n"
+        "- /addsudo &lt;user_id&gt; - grant sudo access.\n"
+        "- /delsudo &lt;user_id&gt; - revoke sudo access.\n"
+        "- /sudos - list sudo users.\n\n"
+        "<b>Monitoring</b>\n"
+        "- /admin - dashboard totals and top users.\n"
+        "- /user &lt;user_id&gt; - inspect one user.\n"
+        "- /users - recent users.\n"
+        "- /blocked - users marked blocked.\n"
+        "- /membership - recent join/member events.\n"
+        "- /broadcast &lt;text&gt; - message active users.\n"
+        "- /exportdb - send a full SQLite backup.\n\n"
+        "<b>Modes</b>\n"
+        f"- /singlemode [on|off|status] - one active file message per user. Current: <b>{single_mode}</b>.\n"
+        f"- /deletetimer &lt;time|off&gt; - reset/delete non-admin file messages. Current: <b>{delete_timer}</b>.\n"
+        "  Examples: <code>/deletetimer 30s</code>, <code>/deletetimer 10m</code>, "
+        "<code>/deletetimer 1h</code>, <code>/deletetimer off</code>."
+    )
+
+
 def build_client(config: Config, db: Database) -> Client:
     app = Client(
         config.session_name,
@@ -753,10 +1153,19 @@ def build_client(config: Config, db: Database) -> Client:
         await track_user(rt, message.from_user)
         await message.reply_text(
             sleek_title(message.from_user.first_name if message.from_user else None),
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Draw a file", callback_data=REFRESH_CALLBACK)]]
-            ),
+            reply_markup=start_keyboard(),
             parse_mode=ParseMode.HTML,
+        )
+
+    @app.on_message(filters.command("help"))
+    async def help_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        user = message.from_user
+        text = admin_help_text(rt) if user and is_sudo_user(rt, user.id) else user_help_text(rt)
+        await message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
 
     @app.on_message(filters.command(["random", "get"]))
@@ -869,6 +1278,81 @@ def build_client(config: Config, db: Database) -> Client:
     async def export_db(client: Client, message: Message) -> None:
         await export_db_command(client, rt, message)
 
+    @app.on_message(filters.command("singlemode"))
+    async def single_mode_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        args = command_args(message)
+        current = rt.db.single_file_mode_enabled()
+        if not args:
+            enabled = not current
+        else:
+            value = args[0].lower()
+            if value in {"on", "enable", "enabled", "yes", "true", "1"}:
+                enabled = True
+            elif value in {"off", "disable", "disabled", "no", "false", "0"}:
+                enabled = False
+            elif value in {"status", "state"}:
+                await message.reply_text(
+                    (
+                        "<b>Single-message mode</b>\n\n"
+                        f"Current state: <b>{'on' if current else 'off'}</b>.\n"
+                        "When on, each user gets one active file message at a time."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            else:
+                await message.reply_text("Use /singlemode, /singlemode on, /singlemode off, or /singlemode status.")
+                return
+        rt.db.set_single_file_mode(enabled)
+        await message.reply_text(
+            (
+                "<b>Single-message mode updated.</b>\n\n"
+                f"State: <b>{'on' if enabled else 'off'}</b>.\n"
+                "When on, a user's previous active file message is reset before a new draw is shown."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    @app.on_message(filters.command("deletetimer"))
+    async def delete_timer_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        args = command_args(message)
+        if not args:
+            current = format_duration(rt.db.delete_timer_seconds())
+            await message.reply_text(
+                (
+                    "<b>Delete timer</b>\n\n"
+                    f"Current timer: <b>{current}</b>.\n"
+                    "Use /deletetimer 30s, /deletetimer 10m, /deletetimer 1h, or /deletetimer off."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        seconds = parse_duration_seconds(args)
+        if seconds is None:
+            await message.reply_text("Use a time like 30s, 10m, 1h, 2d, or off.")
+            return
+        rt.db.set_delete_timer_seconds(seconds)
+        cancel_all_delete_tasks(rt)
+        if seconds <= 0:
+            await message.reply_text(
+                "<b>Delete timer disabled.</b>\n\nPending file timers were cancelled.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await message.reply_text(
+            (
+                "<b>Delete timer updated.</b>\n\n"
+                f"New non-admin file messages will reset/delete after <b>{format_duration(seconds)}</b>."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
     @app.on_message(filters.command("addfile"))
     async def add_file_command(client: Client, message: Message) -> None:
         await track_user(rt, message.from_user)
@@ -946,40 +1430,11 @@ def build_client(config: Config, db: Database) -> Client:
 
     @app.on_message(filters.command("addfsub"))
     async def add_fsub_command(client: Client, message: Message) -> None:
-        await track_user(rt, message.from_user)
-        if not await require_sudo(rt, message):
-            return
-        args = command_args(message)
-        if not args:
-            await message.reply_text("Use /addfsub <chat_id|@username> [invite_link] [title].")
-            return
-        chat_id = args[0]
-        tail = args[1:]
-        manual_invite = None
-        title_parts: list[str] = []
-        for part in tail:
-            maybe_link = normalize_invite_link(part)
-            if maybe_link and not manual_invite:
-                manual_invite = maybe_link
-            else:
-                title_parts.append(part)
-        custom_title = " ".join(title_parts) or None
-        title = custom_title
-        invite_link = manual_invite
-        try:
-            chat = await client.get_chat(chat_ref(chat_id))
-            title = custom_title or chat.title or chat.username or str(chat.id)
-            invite_link = invite_link or getattr(chat, "invite_link", None)
-            if not invite_link and chat.username:
-                invite_link = f"https://t.me/{chat.username}"
-        except RPCError:
-            if chat_id.startswith("@"):
-                invite_link = f"https://t.me/{chat_id[1:]}"
-        rt.db.add_force_sub_chat(chat_id, title, invite_link)
-        await message.reply_text(
-            f"Force-sub enabled for <b>{escape(title or chat_id)}</b>.",
-            parse_mode=ParseMode.HTML,
-        )
+        await add_force_sub_command(client, rt, message, mode=FSUB_MEMBER_MODE)
+
+    @app.on_message(filters.command(["addreqfsub", "addfsubreq"]))
+    async def add_request_fsub_command(client: Client, message: Message) -> None:
+        await add_force_sub_command(client, rt, message, mode=FSUB_REQUEST_MODE)
 
     @app.on_message(filters.command("delfsub"))
     async def del_fsub_command(client: Client, message: Message) -> None:
@@ -990,7 +1445,16 @@ def build_client(config: Config, db: Database) -> Client:
         if not args:
             await message.reply_text("Use /delfsub <chat_id|@username>.")
             return
-        removed = rt.db.remove_force_sub_chat(args[0])
+        target = args[0]
+        resolved_target = target
+        try:
+            chat = await client.get_chat(chat_ref(target))
+            resolved_target = str(chat.id)
+        except RPCError:
+            pass
+        removed = rt.db.remove_force_sub_chat(resolved_target)
+        if not removed and resolved_target != target:
+            removed = rt.db.remove_force_sub_chat(target)
         await message.reply_text(
             "Force-sub chat removed." if removed else "That chat was not configured."
         )
@@ -1005,7 +1469,11 @@ def build_client(config: Config, db: Database) -> Client:
             await message.reply_text("No force-sub chats configured.")
             return
         lines = [
-            f"- <b>{escape(chat.title or chat.chat_id)}</b> | <code>{escape(chat.chat_id)}</code>"
+            (
+                f"- <b>{escape(chat.title or chat.chat_id)}</b> | "
+                f"<code>{escape(chat.chat_id)}</code> | "
+                f"<b>{escape(chat.mode)}</b>"
+            )
             for chat in chats
         ]
         await message.reply_text(
@@ -1196,6 +1664,7 @@ def build_client(config: Config, db: Database) -> Client:
     @app.on_chat_join_request()
     async def chat_join_request(client: Client, request: ChatJoinRequest) -> None:
         if request.from_user:
+            await track_user(rt, request.from_user)
             rt.db.record_membership_event(
                 request.from_user.id,
                 str(request.chat.id),

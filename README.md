@@ -61,6 +61,7 @@ docker run -d --name random-file-bot `
 - `/start` - open the bot and request a random file.
 - `/random` or `/get` - request a random file.
 - `/stats` - show your usage stats.
+- `/help` - show user help, or the admin manual for owner/sudo users.
 
 Every sent file includes a refresh button. Pressing it edits the same message with another random file when Telegram allows that media edit.
 
@@ -75,7 +76,10 @@ Inline usage uses the same request limit as `/random` and refresh clicks.
 The owner is configured with `OWNER_ID`. Sudo users have the same bot-management permissions.
 
 - `/admin` - usage dashboard.
+- `/help` - detailed admin command guide with examples.
 - `/exportdb` - export the full SQLite database for migration or backup.
+- `/singlemode [on|off|status]` - toggle one-active-file-message mode per user.
+- `/deletetimer <time|off>` - reset/delete non-admin file messages after a custom interval. Examples: `/deletetimer 30s`, `/deletetimer 10m`, `/deletetimer 1h`, `/deletetimer off`.
 - `/addfile <file_id> [label]` - add a Telegram file ID as a document.
 - `/addfile <type> <file_id> [label]` - add a typed file ID. Types: `document`, `photo`, `video`, `audio`, `animation`.
 - `/addfile` as a reply to a document/video/audio/photo/animation message - index that media.
@@ -91,15 +95,20 @@ The owner is configured with `OWNER_ID`. Sudo users have the same bot-management
 - `/delsudo <user_id>` - revoke sudo access.
 - `/sudos` - list sudo users.
 - `/addfsub <chat_id|@username> [invite_link] [title]` - require membership in a chat/channel.
+- `/addreqfsub <chat_id|@username> [invite_link] [title]` - require the user to send a join request to a chat/channel.
 - `/delfsub <chat_id|@username>` - remove a force-sub chat.
 - `/fsubs` - list force-sub chats.
 - `/user <user_id>` - inspect a user's usage and status.
 
+`/singlemode` makes each user keep only one active file message at a time. When a new draw is shown, the bot tries to revert the previous file message back to the `/start` prompt; if Telegram will not convert that media message back to text, the bot deletes the old file message instead.
+
+`/deletetimer` applies only to non-owner/non-sudo users and only to file messages sent by the bot. If single-message mode is on, only the user's current active file message is affected. If it is off, each sent file message gets its own timer.
+
 ## Force Subscribe Notes
 
-Add the bot as admin in each force-sub channel/chat. For private channels, use the numeric chat ID and make sure the bot can call `getChatMember`. The bot checks current membership before serving files, so users who leave required chats lose access until they rejoin.
+Add the bot as admin in each force-sub channel/chat. The bot checks its admin status when you add an fsub chat, stores the chat's numeric ID, and creates or uses an invite link so users see the required chat as a button.
 
-If a required chat uses join requests, approve the user in Telegram or through your moderation setup. The bot listens for membership updates and join requests when Telegram sends them, but access is ultimately enforced by live membership checks.
+Normal `/addfsub` checks live membership with Telegram before serving files, so users who leave required chats lose access until they rejoin. `/addreqfsub` uses a join-request invite link where possible; once Telegram sends the bot the user's join-request update, that fsub is treated as fulfilled. If other fsubs remain, the user still has to complete those too.
 
 ## File IDs
 

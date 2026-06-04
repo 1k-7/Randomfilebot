@@ -81,6 +81,7 @@ class Database:
                     chat_id TEXT PRIMARY KEY,
                     title TEXT,
                     invite_link TEXT,
+                    mode TEXT NOT NULL DEFAULT 'member',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL
                 );
@@ -89,6 +90,19 @@ class Database:
                     user_id INTEGER PRIMARY KEY,
                     added_by INTEGER NOT NULL,
                     created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS active_file_messages (
+                    user_id INTEGER PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS membership_events (
@@ -107,6 +121,12 @@ class Database:
                     ON membership_events (created_at);
                 """
             )
+            self._ensure_column(
+                conn,
+                "force_sub_chats",
+                "mode",
+                "TEXT NOT NULL DEFAULT 'member'",
+            )
             conn.execute(
                 """
                 INSERT OR IGNORE INTO sudo_users (user_id, added_by, created_at)
@@ -114,6 +134,20 @@ class Database:
                 """,
                 (owner_id, owner_id, to_db_time()),
             )
+
+    def _ensure_column(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def backup_to(self, destination_path: str | Path) -> None:
         destination_path = Path(destination_path)
@@ -125,6 +159,87 @@ class Database:
                 destination.commit()
             finally:
                 destination.close()
+
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM bot_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+            return str(row["value"]) if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO bot_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, to_db_time()),
+            )
+
+    def single_file_mode_enabled(self) -> bool:
+        return self.get_setting("single_file_mode", "0") == "1"
+
+    def set_single_file_mode(self, enabled: bool) -> None:
+        self.set_setting("single_file_mode", "1" if enabled else "0")
+
+    def delete_timer_seconds(self) -> int:
+        value = self.get_setting("delete_timer_seconds", "0") or "0"
+        try:
+            return max(0, int(value))
+        except ValueError:
+            return 0
+
+    def set_delete_timer_seconds(self, seconds: int) -> None:
+        self.set_setting("delete_timer_seconds", str(max(0, seconds)))
+
+    def get_active_file_message(self, user_id: int) -> tuple[int, int] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT chat_id, message_id FROM active_file_messages WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return int(row["chat_id"]), int(row["message_id"])
+
+    def set_active_file_message(self, user_id: int, chat_id: int, message_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO active_file_messages (user_id, chat_id, message_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    chat_id = excluded.chat_id,
+                    message_id = excluded.message_id,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, chat_id, message_id, to_db_time()),
+            )
+
+    def clear_active_file_message(
+        self,
+        user_id: int,
+        chat_id: int | None = None,
+        message_id: int | None = None,
+    ) -> None:
+        clauses = ["user_id = ?"]
+        params: list[object] = [user_id]
+        if chat_id is not None:
+            clauses.append("chat_id = ?")
+            params.append(chat_id)
+        if message_id is not None:
+            clauses.append("message_id = ?")
+            params.append(message_id)
+        with self.connect() as conn:
+            conn.execute(
+                f"DELETE FROM active_file_messages WHERE {' AND '.join(clauses)}",
+                params,
+            )
 
     def upsert_user(self, user, *, blocked: bool = False) -> None:
         now = to_db_time()
@@ -290,18 +405,20 @@ class Database:
         chat_id: str,
         title: str | None,
         invite_link: str | None,
+        mode: str = "member",
     ) -> None:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO force_sub_chats (chat_id, title, invite_link, enabled, created_at)
-                VALUES (?, ?, ?, 1, ?)
+                INSERT INTO force_sub_chats (chat_id, title, invite_link, mode, enabled, created_at)
+                VALUES (?, ?, ?, ?, 1, ?)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     title = excluded.title,
                     invite_link = excluded.invite_link,
+                    mode = excluded.mode,
                     enabled = 1
                 """,
-                (chat_id, title, invite_link, to_db_time()),
+                (chat_id, title, invite_link, mode, to_db_time()),
             )
 
     def remove_force_sub_chat(self, chat_id: str) -> bool:
@@ -395,6 +512,21 @@ class Database:
                 """,
                 (user_id, chat_id, status, to_db_time()),
             )
+
+    def has_join_request(self, user_id: int, chat_id: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM membership_events
+                WHERE user_id = ?
+                  AND chat_id = ?
+                  AND status = 'join_request'
+                LIMIT 1
+                """,
+                (user_id, chat_id),
+            ).fetchone()
+            return row is not None
 
     def total_stats(self, window_minutes: int = 60) -> dict[str, int]:
         since = utcnow() - timedelta(minutes=window_minutes)
@@ -502,6 +634,7 @@ class Database:
             chat_id=str(row["chat_id"]),
             title=row["title"],
             invite_link=row["invite_link"],
+            mode=str(row["mode"]),
             enabled=bool(row["enabled"]),
             created_at=from_db_time(row["created_at"]) or utcnow(),
         )
