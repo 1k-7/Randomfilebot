@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import string
 import tempfile
 from contextlib import suppress
 from dataclasses import replace
@@ -14,6 +16,7 @@ from html import escape
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.errors import RPCError
+from pyrogram.raw.functions import bots
 from pyrogram.file_id import FileId, FileType
 from pyrogram.types import (
     CallbackQuery,
@@ -32,14 +35,18 @@ from pyrogram.types import (
 )
 
 from .config import Config, load_config
-from .db import Database, utcnow
+from .db import Database, from_db_time, utcnow
 from .models import ForceSubChat, IndexedFile, UserStats
 
 
 REFRESH_CALLBACK = "refresh_file"
+HELP_CALLBACK = "help_page"
 FSUB_MEMBER_MODE = "member"
 FSUB_REQUEST_MODE = "request"
 SUPPORTED_FILE_TYPES = {"document", "photo", "video", "audio", "animation"}
+PROFILE_FIELDS = {"name", "about", "description", "username"}
+ON_VALUES = {"on", "enable", "enabled", "yes", "true", "1"}
+OFF_VALUES = {"off", "disable", "disabled", "no", "false", "0"}
 PYROGRAM_FILE_TYPE_MAP = {
     FileType.PHOTO: "photo",
     FileType.VIDEO: "video",
@@ -85,7 +92,7 @@ def force_sub_keyboard(chats: list[ForceSubChat]) -> InlineKeyboardMarkup:
         title = chat.title or str(chat.chat_id)
         if chat.invite_link:
             buttons.append([InlineKeyboardButton(short_text(title, 48), url=chat.invite_link)])
-    buttons.append([InlineKeyboardButton("I joined", callback_data=REFRESH_CALLBACK)])
+    buttons.append([InlineKeyboardButton("Refresh the velvet rope", callback_data=REFRESH_CALLBACK)])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -136,10 +143,34 @@ def caption_command_is(message: Message, command: str) -> bool:
 
 
 def user_label(stats: UserStats) -> str:
+    return user_mention(stats)
+
+
+def user_mention(stats: UserStats) -> str:
     if stats.username:
-        return f"@{escape(stats.username)}"
-    full_name = " ".join(part for part in [stats.first_name, stats.last_name] if part)
-    return escape(full_name) if full_name else str(stats.user_id)
+        text = f"@{escape(stats.username)}"
+    else:
+        full_name = " ".join(part for part in [stats.first_name, stats.last_name] if part)
+        text = escape(full_name) if full_name else str(stats.user_id)
+    return f'<a href="tg://user?id={stats.user_id}">{text}</a>'
+
+
+def user_text_mention(user_id: int, username: str | None = None, name: str | None = None) -> str:
+    text = f"@{escape(username)}" if username else escape(name or str(user_id))
+    return f'<a href="tg://user?id={user_id}">{text}</a>'
+
+
+def parse_bool_arg(args: list[str], current: bool) -> tuple[bool | None, bool]:
+    if not args:
+        return not current, False
+    value = args[0].lower()
+    if value in ON_VALUES:
+        return True, False
+    if value in OFF_VALUES:
+        return False, False
+    if value in {"status", "state"}:
+        return current, True
+    return None, False
 
 
 def is_block_error(error: RPCError) -> bool:
@@ -207,10 +238,14 @@ def find_random_video(rt: BotRuntime) -> IndexedFile | None:
 async def require_sudo(rt: BotRuntime, message: Message) -> bool:
     user = message.from_user
     if not user:
+        if rt.db.maintenance_mode_enabled():
+            return False
         await message.reply_text("I can only accept admin commands from a visible user account.")
         return False
     if is_sudo_user(rt, user.id):
         return True
+    if rt.db.maintenance_mode_enabled():
+        return False
     await message.reply_text("This panel is only for the owner and sudo users.")
     return False
 
@@ -219,9 +254,32 @@ def is_sudo_user(rt: BotRuntime, user_id: int) -> bool:
     return user_id == rt.config.owner_id or rt.db.is_sudo(user_id)
 
 
+def is_unlimited_user(rt: BotRuntime, user_id: int) -> bool:
+    return is_sudo_user(rt, user_id) or rt.db.is_privileged(user_id)
+
+
 async def track_user(rt: BotRuntime, user) -> None:
     if user:
         rt.db.upsert_user(user, blocked=False)
+
+
+def maintenance_blocks(rt: BotRuntime, user_id: int | None) -> bool:
+    if not rt.db.maintenance_mode_enabled():
+        return False
+    return user_id is None or not is_sudo_user(rt, user_id)
+
+
+async def enforce_maintenance_message(rt: BotRuntime, message: Message) -> bool:
+    user = message.from_user
+    return not maintenance_blocks(rt, user.id if user else None)
+
+
+async def enforce_maintenance_query(rt: BotRuntime, query: CallbackQuery) -> bool:
+    return not maintenance_blocks(rt, query.from_user.id if query.from_user else None)
+
+
+async def enforce_maintenance_inline(rt: BotRuntime, query: InlineQuery) -> bool:
+    return not maintenance_blocks(rt, query.from_user.id if query.from_user else None)
 
 
 async def missing_force_sub_chats(
@@ -289,7 +347,7 @@ def force_sub_text(missing: list[ForceSubChat]) -> str:
     request_note = any(chat.mode == FSUB_REQUEST_MODE for chat in missing)
     text = (
         "<b>One step before the vault opens.</b>\n\n"
-        "Use the required chat buttons below, then tap <b>I joined</b> to continue."
+        "Use the required chat buttons below, then tap <b>Refresh the velvet rope</b> to continue."
     )
     if request_note:
         text += "\n\nFor request-only chats, sending the join request is enough."
@@ -354,9 +412,11 @@ async def enforce_rate_limit_inline(rt: BotRuntime, query: InlineQuery) -> bool:
 
 
 def is_under_rate_limit(rt: BotRuntime, user_id: int) -> bool:
+    if is_unlimited_user(rt, user_id):
+        return True
     since = utcnow() - timedelta(seconds=rt.config.request_window_seconds)
     used = rt.db.requests_since(user_id, since)
-    return used < rt.config.request_limit
+    return used < rt.config.request_limit + rt.db.bonus_requests(user_id)
 
 
 def rate_limit_text(rt: BotRuntime) -> str:
@@ -366,6 +426,12 @@ def rate_limit_text(rt: BotRuntime) -> str:
         f"You can request {rt.config.request_limit} files every {minutes} minutes. "
         "Try again a little later."
     )
+
+
+def user_limit_text(rt: BotRuntime, user_id: int) -> str:
+    if is_unlimited_user(rt, user_id):
+        return "unlimited"
+    return str(rt.config.request_limit + rt.db.bonus_requests(user_id))
 
 
 def cancel_delete_task(rt: BotRuntime, chat_id: int, message_id: int) -> None:
@@ -559,7 +625,7 @@ async def send_random_file_message(
         return
     if rt.db.single_file_mode_enabled():
         await reset_previous_active_file_message(client, rt, user)
-    sent = await send_file_message(client, message.chat.id, item)
+    sent = await send_file_message(client, rt, message.chat.id, item)
     rt.db.record_file_event(user.id, item.id, event_type)
     await remember_file_message(client, rt, user, sent)
 
@@ -599,7 +665,7 @@ async def refresh_random_file(
             await query.message.delete()
         except RPCError:
             pass
-        sent = await send_file_message(client, query.message.chat.id, item)
+        sent = await send_file_message(client, rt, query.message.chat.id, item)
         rt.db.record_file_event(user.id, item.id, event_type)
         await remember_file_message(client, rt, user, sent)
 
@@ -638,7 +704,7 @@ async def edit_message_media(rt: BotRuntime, query: CallbackQuery, item: Indexed
         raise ValueError("No message attached to callback query.")
     try:
         edited = await message.edit_media(
-            media=input_media_for(item),
+            media=input_media_for(rt, item),
             reply_markup=refresh_keyboard(item.id),
         )
         return edited or message
@@ -648,14 +714,16 @@ async def edit_message_media(rt: BotRuntime, query: CallbackQuery, item: Indexed
             raise
         corrected = correct_file_type(rt, item, corrected_type)
         edited = await message.edit_media(
-            media=input_media_for(corrected),
+            media=input_media_for(rt, corrected),
             reply_markup=refresh_keyboard(corrected.id),
         )
         return edited or message
 
 
-def input_media_for(item: IndexedFile):
+def input_media_for(rt: BotRuntime, item: IndexedFile):
     kwargs = {"media": item.file_id, "caption": file_caption(item), "parse_mode": ParseMode.HTML}
+    if rt.db.spoiler_mode_enabled() and item.file_type in {"photo", "video", "animation"}:
+        kwargs["has_spoiler"] = True
     if item.file_type == "photo":
         return InputMediaPhoto(**kwargs)
     if item.file_type == "video":
@@ -667,14 +735,21 @@ def input_media_for(item: IndexedFile):
     return InputMediaDocument(**kwargs)
 
 
-async def send_file_message(client: Client, chat_id: int, item: IndexedFile) -> Message:
-    return await client.send_cached_media(
-        chat_id=chat_id,
-        file_id=item.file_id,
-        caption=file_caption(item),
-        parse_mode=ParseMode.HTML,
-        reply_markup=refresh_keyboard(item.id),
-    )
+async def send_file_message(client: Client, rt: BotRuntime, chat_id: int, item: IndexedFile) -> Message:
+    kwargs = {
+        "chat_id": chat_id,
+        "caption": file_caption(item),
+        "parse_mode": ParseMode.HTML,
+        "reply_markup": refresh_keyboard(item.id),
+    }
+    if rt.db.spoiler_mode_enabled():
+        if item.file_type == "photo":
+            return await client.send_photo(photo=item.file_id, has_spoiler=True, **kwargs)
+        if item.file_type == "video":
+            return await client.send_video(video=item.file_id, has_spoiler=True, **kwargs)
+        if item.file_type == "animation":
+            return await client.send_animation(animation=item.file_id, has_spoiler=True, **kwargs)
+    return await client.send_cached_media(file_id=item.file_id, **kwargs)
 
 
 async def add_force_sub_command(
@@ -690,7 +765,7 @@ async def add_force_sub_command(
     args = command_args(message)
     if not args:
         command = "addreqfsub" if mode == FSUB_REQUEST_MODE else "addfsub"
-        await message.reply_text(f"Use /{command} <chat_id|@username> [invite_link] [title].")
+        await message.reply_text(f"Use /{command} &lt;chat_id|@username&gt; [invite_link] [title].")
         return
 
     chat_id = args[0]
@@ -839,7 +914,7 @@ async def export_db_command(client: Client, rt: BotRuntime, message: Message) ->
             reply_to_message_id=message.id,
         )
         await status.edit_text(
-            "<b>Database export complete.</b>\n\nThe backup file was sent above.",
+            "<b>Database export complete.</b>\n\nThe backup file was sent below.",
             parse_mode=ParseMode.HTML,
         )
     except RPCError:
@@ -861,6 +936,59 @@ async def export_db_command(client: Client, rt: BotRuntime, message: Message) ->
             os.rmdir(temp_dir)
         except OSError:
             pass
+
+
+async def import_db_command(client: Client, rt: BotRuntime, message: Message) -> None:
+    await track_user(rt, message.from_user)
+    if not await require_sudo(rt, message):
+        return
+    reply = message.reply_to_message
+    source = reply if reply and reply.document else message if message.document else None
+    document = source.document if source else None
+    if not source or not document:
+        await message.reply_text(
+            "Send /importdb as a reply to an exported SQLite database, or upload it with /importdb as its caption."
+        )
+        return
+    file_name = (document.file_name or "").lower()
+    if file_name and not file_name.endswith((".sqlite", ".sqlite3", ".db")):
+        await message.reply_text("That does not look like an exported SQLite database.")
+        return
+    status = await message.reply_text(
+        "<b>Database import started.</b>\n\nDownloading SQLite backup...",
+        parse_mode=ParseMode.HTML,
+    )
+    temp_dir = tempfile.mkdtemp(prefix="random-file-bot-db-import-")
+    downloaded_path: str | None = None
+    try:
+        downloaded_path = await source.download(file_name=os.path.join(temp_dir, "import.sqlite3"))
+        if not downloaded_path:
+            await status.edit_text("Import failed: Telegram did not return a downloaded file path.")
+            return
+        await status.edit_text(
+            "<b>Database import in progress.</b>\n\nValidating and restoring backup...",
+            parse_mode=ParseMode.HTML,
+        )
+        await asyncio.to_thread(rt.db.restore_from, downloaded_path)
+        await asyncio.to_thread(rt.db.init, rt.config.owner_id)
+        await status.edit_text(
+            "<b>Database import complete.</b>\n\nThe imported database is now active.",
+            parse_mode=ParseMode.HTML,
+        )
+    except RPCError:
+        await status.edit_text("Telegram would not let me download that database file.")
+    except Exception as error:
+        logging.exception("Database import failed")
+        await status.edit_text(
+            f"Import failed: <code>{escape(error.__class__.__name__)}</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+    finally:
+        if downloaded_path and os.path.exists(downloaded_path):
+            with suppress(OSError):
+                os.remove(downloaded_path)
+        with suppress(OSError):
+            os.rmdir(temp_dir)
 
 
 async def import_json_command(client: Client, rt: BotRuntime, message: Message) -> None:
@@ -1110,6 +1238,166 @@ def format_duration(seconds: int) -> str:
     return f"{seconds} seconds"
 
 
+def random_code(length: int = 10) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def export_record_with_limit(rt: BotRuntime, record: dict[str, object]) -> dict[str, object]:
+    bonus = int(record["bonus_requests"])
+    unlimited = bool(record["is_sudo"]) or bool(record["is_privileged"])
+    return {
+        **record,
+        "effective_limit": "unlimited" if unlimited else rt.config.request_limit + bonus,
+        "first_seen": format_dt(from_db_time_text(record["first_seen"])),
+        "last_seen": format_dt(from_db_time_text(record["last_seen"])),
+        "last_request_at": format_dt(from_db_time_text(record["last_request_at"])),
+    }
+
+
+def from_db_time_text(value: object):
+    if value is None:
+        return None
+    return from_db_time(str(value))
+
+
+def users_export_text(records: list[dict[str, object]]) -> str:
+    lines = [
+        "user_id\tusername\tname\tblocked\trequests\trefreshes\tfiles_sent\tdenied\tbonus\teffective_limit\tsudo\tprivileged\treferrals\tfirst_seen\tlast_seen\tlast_request_at"
+    ]
+    for record in records:
+        name = " ".join(
+            str(part)
+            for part in [record["first_name"], record["last_name"]]
+            if part
+        )
+        lines.append(
+            "\t".join(
+                str(value if value is not None else "")
+                for value in [
+                    record["user_id"],
+                    record["username"],
+                    name,
+                    "yes" if record["is_blocked"] else "no",
+                    record["request_count"],
+                    record["refresh_count"],
+                    record["files_sent"],
+                    record["denied_count"],
+                    record["bonus_requests"],
+                    record["effective_limit"],
+                    "yes" if record["is_sudo"] else "no",
+                    "yes" if record["is_privileged"] else "no",
+                    record["referrals"],
+                    record["first_seen"],
+                    record["last_seen"],
+                    record["last_request_at"],
+                ]
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def write_users_export(records: list[dict[str, object]], path: str, fmt: str) -> None:
+    if fmt == "json":
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(records, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        return
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(users_export_text(records))
+
+
+async def send_full_users_export(client: Client, rt: BotRuntime, message: Message, fmt: str) -> None:
+    raw_records = await asyncio.to_thread(rt.db.user_export_records)
+    records = [export_record_with_limit(rt, record) for record in raw_records]
+    temp_dir = tempfile.mkdtemp(prefix="random-file-bot-users-")
+    path = os.path.join(temp_dir, f"users-full.{fmt}")
+    try:
+        await asyncio.to_thread(write_users_export, records, path, fmt)
+        await client.send_document(
+            chat_id=message.chat.id,
+            document=path,
+            caption=f"<b>Full user export</b>\n\nUsers: <b>{len(records)}</b>.",
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=message.id,
+        )
+    finally:
+        with suppress(OSError):
+            os.remove(path)
+        with suppress(OSError):
+            os.rmdir(temp_dir)
+
+
+def admin_help_pages(rt: BotRuntime) -> list[str]:
+    single_mode = "on" if rt.db.single_file_mode_enabled() else "off"
+    spoiler_mode = "on" if rt.db.spoiler_mode_enabled() else "off"
+    maintenance = "on" if rt.db.maintenance_mode_enabled() else "off"
+    referrals = "on" if rt.db.referral_mode_enabled() else "off"
+    delete_timer = format_duration(rt.db.delete_timer_seconds())
+    return [
+        (
+            "<b>Admin manual 1/4</b>\n\n"
+            "<b>User flow</b>\n"
+            "- /start - show the draw prompt.\n"
+            "- /random or /get - send a random vault file.\n"
+            "- /stats - show your usage.\n"
+            "- /refer - create your referral link.\n"
+            "- /redeem &lt;code&gt; - redeem a promo code.\n"
+            "- Inline: <code>@YourBotUsername</code> - send a random cached video."
+        ),
+        (
+            "<b>Admin manual 2/4</b>\n\n"
+            "<b>Vault and backups</b>\n"
+            "- /addfile &lt;file_id&gt; [label] - index a file.\n"
+            "- /addfile &lt;type&gt; &lt;file_id&gt; [label] - type: document, photo, video, audio, animation.\n"
+            "- Reply to media with /addfile - index that media.\n"
+            "- /importjson [replace] - import file IDs from JSON.\n"
+            "- /importdb - restore an exported SQLite DB.\n"
+            "- /exportdb - send a full SQLite backup.\n"
+            "- /delfile &lt;file_id&gt; - remove a file.\n"
+            "- /files - indexed file summary."
+        ),
+        (
+            "<b>Admin manual 3/4</b>\n\n"
+            "<b>Access and users</b>\n"
+            "- /addfsub &lt;chat_id|@username&gt; [invite_link] [title] - require membership.\n"
+            "- /addreqfsub &lt;chat_id|@username&gt; [invite_link] [title] - require join request.\n"
+            "- /delfsub &lt;chat_id|@username&gt; - remove force-sub.\n"
+            "- /addsudo, /delsudo, /sudos - manage sudo users.\n"
+            "- /addpriv &lt;user_id&gt;, /delpriv &lt;user_id&gt;, /privs - unlimited users with no admin rights.\n"
+            "- /users [-full] [-txt|-json] - recent users or full export.\n"
+            "- /user &lt;user_id&gt;, /blocked, /membership, /broadcast &lt;text&gt;."
+        ),
+        (
+            "<b>Admin manual 4/4</b>\n\n"
+            "<b>Modes and profile</b>\n"
+            f"- /maintenance [on|off|status] - dead mode for non-admins. Current: <b>{maintenance}</b>.\n"
+            f"- /spoiler [on|off|status] - spoiler all photo/video/animation media. Current: <b>{spoiler_mode}</b>.\n"
+            f"- /singlemode [on|off|status] - one active file message. Current: <b>{single_mode}</b>.\n"
+            f"- /deletetimer &lt;time|off&gt; - reset/delete file messages. Current: <b>{delete_timer}</b>.\n"
+            f"- /referrals [on|off|status] [bonus n] - referrals. Current: <b>{referrals}</b>, bonus <b>{rt.db.referral_bonus()}</b>.\n"
+            "- /promo &lt;bonus&gt; &lt;max_uses&gt; [expiry] [code] - create promo code.\n"
+            "- /setbot &lt;name|about|description|username&gt; &lt;text&gt; - update bot profile.\n"
+            "- /delbot &lt;about|description|username|botpic&gt; - clear profile field.\n"
+            "- /setbotpic - reply to a photo to set bot picture."
+        ),
+    ]
+
+
+def help_keyboard(page: int, total: int) -> InlineKeyboardMarkup:
+    prev_page = (page - 1) % total
+    next_page = (page + 1) % total
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Prev", callback_data=f"{HELP_CALLBACK}:{prev_page}"),
+                InlineKeyboardButton(f"{page + 1}/{total}", callback_data=f"{HELP_CALLBACK}:{page}"),
+                InlineKeyboardButton("Next", callback_data=f"{HELP_CALLBACK}:{next_page}"),
+            ]
+        ]
+    )
+
+
 def user_help_text(rt: BotRuntime) -> str:
     minutes = max(1, rt.config.request_window_seconds // 60)
     return (
@@ -1118,6 +1406,8 @@ def user_help_text(rt: BotRuntime) -> str:
         "<b>Commands</b>\n"
         "- /random or /get - draw a file\n"
         "- /stats - see your usage\n"
+        "- /refer - get your referral link\n"
+        "- /redeem &lt;code&gt; - add promo requests\n"
         "- /help - open this note\n\n"
         "Use the refresh button under a file for another draw. "
         f"Limit: <b>{rt.config.request_limit}</b> files every <b>{minutes}</b> minutes."
@@ -1125,50 +1415,7 @@ def user_help_text(rt: BotRuntime) -> str:
 
 
 def admin_help_text(rt: BotRuntime) -> str:
-    single_mode = "on" if rt.db.single_file_mode_enabled() else "off"
-    delete_timer = format_duration(rt.db.delete_timer_seconds())
-    return (
-        "<b>Admin manual</b>\n\n"
-        "Everything sharp, logged, and mildly suspicious of chaos.\n\n"
-        "<b>User flow</b>\n"
-        "- /start - show the draw prompt.\n"
-        "- /random or /get - send a random vault file.\n"
-        "- /stats - show your own usage.\n"
-        "- /help - role-aware help.\n"
-        "- Inline: <code>@YourBotUsername</code> - send a random cached video.\n\n"
-        "<b>Vault files</b>\n"
-        "- /addfile &lt;file_id&gt; [label] - index a document file ID.\n"
-        "- /addfile &lt;type&gt; &lt;file_id&gt; [label] - index a typed file. "
-        "Types: document, photo, video, audio, animation.\n"
-        "- Reply to media with /addfile - index that media directly.\n"
-        "- /importjson - reply to a JSON document and import file IDs.\n"
-        "- /importjson replace - replace indexed files from JSON.\n"
-        "- /delfile &lt;file_id&gt; - remove one indexed file.\n"
-        "- /files - show total indexed files and recent entries.\n\n"
-        "<b>Access control</b>\n"
-        "- /addfsub &lt;chat_id|@username&gt; [invite_link] [title] - require chat/channel membership.\n"
-        "- /addreqfsub &lt;chat_id|@username&gt; [invite_link] [title] - require a join request.\n"
-        "- /delfsub &lt;chat_id|@username&gt; - remove a force-sub chat.\n"
-        "- /fsubs - list force-sub chats.\n"
-        "- /addsudo &lt;user_id&gt; - grant sudo access.\n"
-        "- /delsudo &lt;user_id&gt; - revoke sudo access.\n"
-        "- /sudos - list sudo users.\n\n"
-        "<b>Monitoring</b>\n"
-        "- /admin - dashboard totals and top users.\n"
-        "- /user &lt;user_id&gt; - inspect one user.\n"
-        "- /users - recent users.\n"
-        "- /blocked - users marked blocked.\n"
-        "- /membership - recent join/member events.\n"
-        "- /broadcast &lt;text&gt; - message active users.\n"
-        "- /exportdb - send a full SQLite backup.\n\n"
-        "<b>Modes</b>\n"
-        f"- /singlemode [on|off|status] - one active file message per user. Current: <b>{single_mode}</b>.\n"
-        f"- /deletetimer &lt;time|off&gt; - reset/delete non-admin file messages. Current: <b>{delete_timer}</b>.\n"
-        "  Examples: <code>/deletetimer 30s</code>, <code>/deletetimer 10m</code>, "
-        "<code>/deletetimer 1h</code>, <code>/deletetimer off</code>.\n"
-        "- /setimg - (reply to photo) set the /start menu placeholder image.\n"
-        "- /delimg - remove the /start menu placeholder image."
-    )
+    return admin_help_pages(rt)[0]
 
 
 def build_client(config: Config, db: Database) -> Client:
@@ -1186,6 +1433,13 @@ def build_client(config: Config, db: Database) -> Client:
     @app.on_message(filters.command("start"))
     async def start(client: Client, message: Message) -> None:
         await track_user(rt, message.from_user)
+        if not await enforce_maintenance_message(rt, message):
+            return
+        args = command_args(message)
+        if message.from_user and args and args[0].startswith("ref_"):
+            with suppress(ValueError):
+                referrer_id = int(args[0].removeprefix("ref_"))
+                rt.db.create_referral(referrer_id, message.from_user.id)
         start_img = rt.db.get_setting("start_image_id")
         text = sleek_title(message.from_user.first_name if message.from_user else None)
         
@@ -1206,17 +1460,47 @@ def build_client(config: Config, db: Database) -> Client:
     @app.on_message(filters.command("help"))
     async def help_command(client: Client, message: Message) -> None:
         await track_user(rt, message.from_user)
+        if not await enforce_maintenance_message(rt, message):
+            return
         user = message.from_user
-        text = admin_help_text(rt) if user and is_sudo_user(rt, user.id) else user_help_text(rt)
+        if user and is_sudo_user(rt, user.id):
+            pages = admin_help_pages(rt)
+            await message.reply_text(
+                pages[0],
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=help_keyboard(0, len(pages)),
+            )
+            return
+        text = user_help_text(rt)
         await message.reply_text(
             text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
 
+    @app.on_callback_query(filters.regex(re.compile(rf"^{HELP_CALLBACK}:\d+$")))
+    async def help_callback(client: Client, query: CallbackQuery) -> None:
+        await track_user(rt, query.from_user)
+        if not query.from_user or not is_sudo_user(rt, query.from_user.id):
+            await query.answer("Admin help only.", show_alert=True)
+            return
+        pages = admin_help_pages(rt)
+        page = int((query.data or "0").rsplit(":", 1)[1]) % len(pages)
+        await query.answer()
+        if query.message:
+            await query.message.edit_text(
+                pages[page],
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=help_keyboard(page, len(pages)),
+            )
+
     @app.on_message(filters.command(["random", "get"]))
     async def random_command(client: Client, message: Message) -> None:
         await track_user(rt, message.from_user)
+        if not await enforce_maintenance_message(rt, message):
+            return
         if not await enforce_force_sub_message(client, rt, message):
             return
         if not await enforce_rate_limit_message(rt, message):
@@ -1226,6 +1510,8 @@ def build_client(config: Config, db: Database) -> Client:
     @app.on_callback_query(filters.regex(re.compile(rf"^{REFRESH_CALLBACK}(:\d+)?$")))
     async def refresh_callback(client: Client, query: CallbackQuery) -> None:
         await track_user(rt, query.from_user)
+        if not await enforce_maintenance_query(rt, query):
+            return
         if not await enforce_force_sub_query(client, rt, query):
             return
         if not await enforce_rate_limit_query(rt, query):
@@ -1242,6 +1528,9 @@ def build_client(config: Config, db: Database) -> Client:
     @app.on_inline_query()
     async def inline_random_video(client: Client, query: InlineQuery) -> None:
         await track_user(rt, query.from_user)
+        if not await enforce_maintenance_inline(rt, query):
+            await query.answer([], cache_time=0, is_personal=True)
+            return
         if query.query.strip():
             await query.answer([], cache_time=0, is_personal=True)
             return
@@ -1278,6 +1567,8 @@ def build_client(config: Config, db: Database) -> Client:
     @app.on_message(filters.command("stats"))
     async def stats_command(client: Client, message: Message) -> None:
         await track_user(rt, message.from_user)
+        if not await enforce_maintenance_message(rt, message):
+            return
         if not message.from_user:
             return
         stats = rt.db.get_user_stats(message.from_user.id)
@@ -1289,6 +1580,9 @@ def build_client(config: Config, db: Database) -> Client:
                 f"Files sent: <b>{stats.files_sent}</b>\n"
                 f"Refreshes: <b>{stats.refresh_count}</b>\n"
                 f"Denied attempts: <b>{stats.denied_count}</b>\n"
+                f"Current limit: <b>{user_limit_text(rt, stats.user_id)}</b>\n"
+                f"Bonus requests: <b>{rt.db.bonus_requests(stats.user_id)}</b>\n"
+                f"Referrals: <b>{rt.db.referral_count(stats.user_id)}</b>\n"
                 f"Last request: <b>{format_dt(stats.last_request_at)}</b>"
             ),
             parse_mode=ParseMode.HTML,
@@ -1323,6 +1617,194 @@ def build_client(config: Config, db: Database) -> Client:
     @app.on_message(filters.command("exportdb"))
     async def export_db(client: Client, message: Message) -> None:
         await export_db_command(client, rt, message)
+
+    @app.on_message(filters.command("importdb"))
+    async def import_db(client: Client, message: Message) -> None:
+        await import_db_command(client, rt, message)
+
+    @app.on_message(filters.command("maintenance"))
+    async def maintenance_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        args = command_args(message)
+        current = rt.db.maintenance_mode_enabled()
+        enabled, status_only = parse_bool_arg(args, current)
+        if enabled is None:
+            await message.reply_text("Use /maintenance, /maintenance on, /maintenance off, or /maintenance status.")
+            return
+        if status_only:
+            await message.reply_text(
+                f"<b>Maintenance mode</b>\n\nCurrent state: <b>{'on' if current else 'off'}</b>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        rt.db.set_maintenance_mode(enabled)
+        await message.reply_text(
+            (
+                "<b>Maintenance mode updated.</b>\n\n"
+                f"State: <b>{'on' if enabled else 'off'}</b>.\n"
+                "When on, non-admin users get no bot responses."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    @app.on_message(filters.command("refer"))
+    async def refer_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await enforce_maintenance_message(rt, message):
+            return
+        if not message.from_user:
+            return
+        if not rt.db.referral_mode_enabled():
+            await message.reply_text("Referrals are not open right now.")
+            return
+        me = await client.get_me()
+        if not me.username:
+            await message.reply_text("I need a public bot username before referral links can be created.")
+            return
+        link = f"https://t.me/{me.username}?start=ref_{message.from_user.id}"
+        await message.reply_text(
+            (
+                "<b>Your referral link</b>\n\n"
+                f"<code>{escape(link)}</code>\n\n"
+                f"Each new user who starts with it adds <b>{rt.db.referral_bonus()}</b> bonus requests."
+            ),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+    @app.on_message(filters.command("redeem"))
+    async def redeem_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await enforce_maintenance_message(rt, message):
+            return
+        if not message.from_user:
+            return
+        args = command_args(message)
+        if not args:
+            await message.reply_text("Use /redeem &lt;code&gt;.")
+            return
+        ok, text, total = rt.db.redeem_promo_code(args[0].strip(), message.from_user.id)
+        if not ok:
+            await message.reply_text(text)
+            return
+        await message.reply_text(
+            f"<b>{escape(text)}</b>\n\nBonus requests now: <b>{total}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    @app.on_message(filters.command("spoiler"))
+    async def spoiler_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        args = command_args(message)
+        current = rt.db.spoiler_mode_enabled()
+        enabled, status_only = parse_bool_arg(args, current)
+        if enabled is None:
+            await message.reply_text("Use /spoiler, /spoiler on, /spoiler off, or /spoiler status.")
+            return
+        if status_only:
+            await message.reply_text(
+                f"<b>Spoiler mode</b>\n\nCurrent state: <b>{'on' if current else 'off'}</b>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        rt.db.set_spoiler_mode(enabled)
+        await message.reply_text(
+            f"<b>Spoiler mode updated.</b>\n\nState: <b>{'on' if enabled else 'off'}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    @app.on_message(filters.command("referrals"))
+    async def referrals_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        args = command_args(message)
+        current = rt.db.referral_mode_enabled()
+        enabled: bool | None = current
+        status_only = not args
+        if args:
+            first = args[0].lower()
+            if first in ON_VALUES:
+                enabled = True
+                status_only = False
+            elif first in OFF_VALUES:
+                enabled = False
+                status_only = False
+            elif first in {"status", "state"}:
+                status_only = True
+            elif first != "bonus":
+                await message.reply_text("Use /referrals [on|off|status] [bonus n].")
+                return
+        if "bonus" in [arg.lower() for arg in args]:
+            try:
+                idx = [arg.lower() for arg in args].index("bonus")
+                bonus = int(args[idx + 1])
+            except (ValueError, IndexError):
+                await message.reply_text("Use /referrals bonus &lt;number&gt;.")
+                return
+            rt.db.set_referral_bonus(bonus)
+            status_only = False
+        if enabled is not None:
+            rt.db.set_referral_mode(enabled)
+        await message.reply_text(
+            (
+                "<b>Referral settings</b>\n\n"
+                f"State: <b>{'on' if rt.db.referral_mode_enabled() else 'off'}</b>\n"
+                f"Bonus per referral: <b>{rt.db.referral_bonus()}</b>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+    @app.on_message(filters.command("promo"))
+    async def promo_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        args = command_args(message)
+        if len(args) < 2:
+            await message.reply_text("Use /promo &lt;bonus_requests&gt; &lt;max_uses&gt; [expiry] [code].")
+            return
+        try:
+            bonus = int(args[0])
+            max_uses = int(args[1])
+        except ValueError:
+            await message.reply_text("Bonus requests and max uses must be numbers.")
+            return
+        expires_at = None
+        code = None
+        if len(args) >= 3:
+            maybe_expiry = parse_duration_seconds([args[2]])
+            if maybe_expiry and maybe_expiry > 0:
+                expires_at = utcnow() + timedelta(seconds=maybe_expiry)
+                code = args[3] if len(args) >= 4 else None
+            else:
+                code = args[2]
+        code = (code or random_code()).upper()
+        if not re.fullmatch(r"[A-Z0-9_-]{4,32}", code):
+            await message.reply_text("Promo code must be 4-32 characters: letters, numbers, _ or -.")
+            return
+        rt.db.create_promo_code(
+            code,
+            bonus_requests=bonus,
+            max_uses=max_uses,
+            expires_at=expires_at,
+            created_by=message.from_user.id,
+        )
+        expiry_text = format_dt(expires_at) if expires_at else "never"
+        await message.reply_text(
+            (
+                "<b>Promo code ready</b>\n\n"
+                f"Code: <code>{escape(code)}</code>\n"
+                f"Bonus requests: <b>{max(0, bonus)}</b>\n"
+                f"Max redemptions: <b>{max(1, max_uses)}</b>\n"
+                f"Expires: <b>{expiry_text}</b>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
 
     @app.on_message(filters.command("singlemode"))
     async def single_mode_command(client: Client, message: Message) -> None:
@@ -1419,6 +1901,88 @@ def build_client(config: Config, db: Database) -> Client:
         rt.db.set_setting("start_image_id", "")
         await message.reply_text("Start menu placeholder image removed. The bot will now default back to text-only.")
 
+    @app.on_message(filters.command("setbot"))
+    async def set_bot_profile_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        args = command_args(message)
+        if len(args) < 2 or args[0].lower() not in PROFILE_FIELDS:
+            await message.reply_text("Use /setbot &lt;name|about|description|username&gt; &lt;text&gt;.")
+            return
+        field = args[0].lower()
+        value = " ".join(args[1:]).strip()
+        try:
+            if field == "username":
+                await client.set_username(value.lstrip("@"))
+            elif field == "name":
+                await client.invoke(bots.SetBotInfo(lang_code="", name=value))
+            elif field == "about":
+                await client.invoke(bots.SetBotInfo(lang_code="", about=value))
+            else:
+                await client.invoke(bots.SetBotInfo(lang_code="", description=value))
+        except RPCError as error:
+            await message.reply_text(f"Telegram rejected that update: <code>{escape(error.__class__.__name__)}</code>.", parse_mode=ParseMode.HTML)
+            return
+        await message.reply_text(f"Bot {field} updated.")
+
+    @app.on_message(filters.command("delbot"))
+    async def delete_bot_profile_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        args = command_args(message)
+        if not args or args[0].lower() not in {"name", "about", "description", "username", "botpic", "photo", "pic"}:
+            await message.reply_text("Use /delbot &lt;name|about|description|username|botpic&gt;.")
+            return
+        field = args[0].lower()
+        try:
+            if field == "username":
+                await client.set_username(None)
+            elif field == "about":
+                await client.invoke(bots.SetBotInfo(lang_code="", about=""))
+            elif field == "description":
+                await client.invoke(bots.SetBotInfo(lang_code="", description=""))
+            elif field == "name":
+                await client.invoke(bots.SetBotInfo(lang_code="", name=""))
+            else:
+                photos = []
+                async for photo in client.get_chat_photos("me", limit=1):
+                    photos.append(photo.file_id)
+                if not photos:
+                    await message.reply_text("No bot profile photo is set.")
+                    return
+                await client.delete_profile_photos(photos)
+        except RPCError as error:
+            await message.reply_text(f"Telegram rejected that update: <code>{escape(error.__class__.__name__)}</code>.", parse_mode=ParseMode.HTML)
+            return
+        await message.reply_text(f"Bot {field} cleared.")
+
+    @app.on_message(filters.command("setbotpic"))
+    async def set_bot_picture_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        reply = message.reply_to_message
+        if not reply or not reply.photo:
+            await message.reply_text("Reply to a photo with /setbotpic.")
+            return
+        temp_dir = tempfile.mkdtemp(prefix="random-file-bot-profile-")
+        path: str | None = None
+        try:
+            path = await reply.download(file_name=os.path.join(temp_dir, "botpic.jpg"))
+            await client.set_profile_photo(photo=path)
+        except RPCError as error:
+            await message.reply_text(f"Telegram rejected that photo: <code>{escape(error.__class__.__name__)}</code>.", parse_mode=ParseMode.HTML)
+            return
+        finally:
+            if path and os.path.exists(path):
+                with suppress(OSError):
+                    os.remove(path)
+            with suppress(OSError):
+                os.rmdir(temp_dir)
+        await message.reply_text("Bot profile photo updated.")
+
     @app.on_message(filters.command("addfile"))
     async def add_file_command(client: Client, message: Message) -> None:
         await track_user(rt, message.from_user)
@@ -1439,7 +2003,7 @@ def build_client(config: Config, db: Database) -> Client:
                 label = " ".join(args[1:]) or None
         else:
             await message.reply_text(
-                "Use /addfile <file_id> [label], /addfile <type> <file_id> [label], or reply to media with /addfile."
+                "Use /addfile &lt;file_id&gt; [label], /addfile &lt;type&gt; &lt;file_id&gt; [label], or reply to media with /addfile."
             )
             return
 
@@ -1462,6 +2026,9 @@ def build_client(config: Config, db: Database) -> Client:
         if caption_command_is(message, "importjson"):
             await import_json_command(client, rt, message)
             return
+        if caption_command_is(message, "importdb"):
+            await import_db_command(client, rt, message)
+            return
         await track_user(rt, message.from_user)
 
     @app.on_message(filters.command("delfile"))
@@ -1471,7 +2038,7 @@ def build_client(config: Config, db: Database) -> Client:
             return
         args = command_args(message)
         if not args:
-            await message.reply_text("Use /delfile <file_id>.")
+            await message.reply_text("Use /delfile &lt;file_id&gt;.")
             return
         removed = rt.db.remove_file(args[0])
         await message.reply_text("File removed." if removed else "That file was not indexed.")
@@ -1509,7 +2076,7 @@ def build_client(config: Config, db: Database) -> Client:
             return
         args = command_args(message)
         if not args:
-            await message.reply_text("Use /delfsub <chat_id|@username>.")
+            await message.reply_text("Use /delfsub &lt;chat_id|@username&gt;.")
             return
         target = args[0]
         resolved_target = target
@@ -1554,13 +2121,14 @@ def build_client(config: Config, db: Database) -> Client:
             return
         args = command_args(message)
         if not args:
-            await message.reply_text("Use /addsudo <user_id>.")
+            await message.reply_text("Use /addsudo &lt;user_id&gt;.")
             return
         try:
             user_id = int(args[0])
         except ValueError:
             await message.reply_text("User ID must be numeric.")
             return
+        rt.db.ensure_user_record(user_id)
         rt.db.add_sudo(user_id, message.from_user.id)
         await message.reply_text(f"Added sudo user <code>{user_id}</code>.", parse_mode=ParseMode.HTML)
 
@@ -1571,7 +2139,7 @@ def build_client(config: Config, db: Database) -> Client:
             return
         args = command_args(message)
         if not args:
-            await message.reply_text("Use /delsudo <user_id>.")
+            await message.reply_text("Use /delsudo &lt;user_id&gt;.")
             return
         try:
             user_id = int(args[0])
@@ -1590,9 +2158,72 @@ def build_client(config: Config, db: Database) -> Client:
         if not await require_sudo(rt, message):
             return
         sudos = rt.db.list_sudos()
-        lines = "\n".join(f"- <code>{user_id}</code>" for user_id in sudos)
+        lines = []
+        for user_id in sudos:
+            stats = rt.db.get_user_stats(user_id)
+            if stats:
+                lines.append(f"- <code>{user_id}</code> | {user_label(stats)}")
+            else:
+                lines.append(f"- <code>{user_id}</code> | {user_text_mention(user_id)}")
+        text = "\n".join(lines) or "No sudo users configured."
         await message.reply_text(
-            "<b>Sudo users</b>\n\n" + lines,
+            "<b>Sudo users</b>\n\n" + text,
+            parse_mode=ParseMode.HTML,
+        )
+
+    @app.on_message(filters.command("addpriv"))
+    async def add_privileged_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        args = command_args(message)
+        if not args:
+            await message.reply_text("Use /addpriv &lt;user_id&gt;.")
+            return
+        try:
+            user_id = int(args[0])
+        except ValueError:
+            await message.reply_text("User ID must be numeric.")
+            return
+        rt.db.ensure_user_record(user_id)
+        rt.db.add_privileged(user_id, message.from_user.id)
+        await message.reply_text(
+            f"Added unlimited user {user_text_mention(user_id)}.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    @app.on_message(filters.command("delpriv"))
+    async def del_privileged_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        args = command_args(message)
+        if not args:
+            await message.reply_text("Use /delpriv &lt;user_id&gt;.")
+            return
+        try:
+            user_id = int(args[0])
+        except ValueError:
+            await message.reply_text("User ID must be numeric.")
+            return
+        removed = rt.db.remove_privileged(user_id)
+        await message.reply_text("Unlimited user removed." if removed else "That user was not unlimited.")
+
+    @app.on_message(filters.command("privs"))
+    async def privileged_users_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        privileged = rt.db.list_privileged()
+        lines = []
+        for user_id in privileged:
+            stats = rt.db.get_user_stats(user_id)
+            if stats:
+                lines.append(f"- <code>{user_id}</code> | {user_label(stats)}")
+            else:
+                lines.append(f"- <code>{user_id}</code> | {user_text_mention(user_id)}")
+        await message.reply_text(
+            "<b>Unlimited users</b>\n\n" + ("\n".join(lines) if lines else "No unlimited users configured."),
             parse_mode=ParseMode.HTML,
         )
 
@@ -1603,7 +2234,7 @@ def build_client(config: Config, db: Database) -> Client:
             return
         args = command_args(message)
         if not args:
-            await message.reply_text("Use /user <user_id>.")
+            await message.reply_text("Use /user &lt;user_id&gt;.")
             return
         try:
             user_id = int(args[0])
@@ -1623,6 +2254,11 @@ def build_client(config: Config, db: Database) -> Client:
                 f"Refreshes: <b>{stats.refresh_count}</b>\n"
                 f"Files sent: <b>{stats.files_sent}</b>\n"
                 f"Denied: <b>{stats.denied_count}</b>\n"
+                f"Bonus requests: <b>{rt.db.bonus_requests(stats.user_id)}</b>\n"
+                f"Effective limit: <b>{user_limit_text(rt, stats.user_id)}</b>\n"
+                f"Sudo: <b>{'yes' if is_sudo_user(rt, stats.user_id) else 'no'}</b>\n"
+                f"Unlimited: <b>{'yes' if rt.db.is_privileged(stats.user_id) else 'no'}</b>\n"
+                f"Referrals: <b>{rt.db.referral_count(stats.user_id)}</b>\n"
                 f"First seen: <b>{format_dt(stats.first_seen)}</b>\n"
                 f"Last seen: <b>{format_dt(stats.last_seen)}</b>\n"
                 f"Last request: <b>{format_dt(stats.last_request_at)}</b>"
@@ -1634,6 +2270,13 @@ def build_client(config: Config, db: Database) -> Client:
     async def users_command(client: Client, message: Message) -> None:
         await track_user(rt, message.from_user)
         if not await require_sudo(rt, message):
+            return
+        args = [arg.lower() for arg in command_args(message)]
+        if "-full" in args or "full" in args:
+            fmt = "json" if "-json" in args or "json" in args else "txt"
+            if "-txt" in args or "txt" in args:
+                fmt = "txt"
+            await send_full_users_export(client, rt, message, fmt)
             return
         users = rt.db.recent_users(15)
         if not users:
@@ -1694,7 +2337,7 @@ def build_client(config: Config, db: Database) -> Client:
             return
         text = (message.text or message.caption or "").partition(" ")[2].strip()
         if not text:
-            await message.reply_text("Use /broadcast <text>.")
+            await message.reply_text("Use /broadcast &lt;text&gt;.")
             return
         sent = 0
         blocked = 0

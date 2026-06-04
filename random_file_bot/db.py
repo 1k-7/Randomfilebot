@@ -4,6 +4,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from shutil import copy2
 from typing import Iterator
 
 from .models import ForceSubChat, IndexedFile, MembershipEvent, UserStats
@@ -32,7 +33,10 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
         try:
             yield conn
             conn.commit()
@@ -98,6 +102,43 @@ class Database:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS privileged_users (
+                    user_id INTEGER PRIMARY KEY,
+                    added_by INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS user_bonuses (
+                    user_id INTEGER PRIMARY KEY,
+                    bonus_requests INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS referrals (
+                    referred_id INTEGER PRIMARY KEY,
+                    referrer_id INTEGER NOT NULL,
+                    bonus_awarded INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS promo_codes (
+                    code TEXT PRIMARY KEY,
+                    bonus_requests INTEGER NOT NULL,
+                    max_uses INTEGER NOT NULL,
+                    uses INTEGER NOT NULL DEFAULT 0,
+                    expires_at TEXT,
+                    created_by INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS promo_redemptions (
+                    code TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    redeemed_at TEXT NOT NULL,
+                    PRIMARY KEY (code, user_id),
+                    FOREIGN KEY(code) REFERENCES promo_codes(code) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS active_file_messages (
                     user_id INTEGER PRIMARY KEY,
                     chat_id INTEGER NOT NULL,
@@ -119,6 +160,16 @@ class Database:
                     ON file_events (event_type, created_at);
                 CREATE INDEX IF NOT EXISTS idx_membership_events_time
                     ON membership_events (created_at);
+                CREATE INDEX IF NOT EXISTS idx_users_first_seen
+                    ON users (first_seen DESC);
+                CREATE INDEX IF NOT EXISTS idx_users_last_seen
+                    ON users (last_seen DESC);
+                CREATE INDEX IF NOT EXISTS idx_indexed_files_type_id
+                    ON indexed_files (file_type, id);
+                CREATE INDEX IF NOT EXISTS idx_referrals_referrer
+                    ON referrals (referrer_id);
+                CREATE INDEX IF NOT EXISTS idx_promo_expires
+                    ON promo_codes (expires_at);
                 """
             )
             self._ensure_column(
@@ -160,6 +211,31 @@ class Database:
             finally:
                 destination.close()
 
+    def restore_from(self, source_path: str | Path) -> None:
+        source_path = Path(source_path)
+        backup_path = self.path.with_suffix(self.path.suffix + ".pre-import")
+        with sqlite3.connect(source_path) as candidate:
+            integrity = candidate.execute("PRAGMA integrity_check").fetchone()
+            if not integrity or str(integrity[0]).lower() != "ok":
+                raise ValueError("SQLite integrity check failed")
+            required = {"users", "indexed_files", "file_events", "bot_settings"}
+            rows = candidate.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            present = {str(row[0]) for row in rows}
+            missing = required - present
+            if missing:
+                raise ValueError(f"Missing required tables: {', '.join(sorted(missing))}")
+        if self.path.exists():
+            copy2(self.path, backup_path)
+        with sqlite3.connect(source_path) as source:
+            destination = sqlite3.connect(self.path)
+            try:
+                source.backup(destination)
+                destination.commit()
+            finally:
+                destination.close()
+
     def get_setting(self, key: str, default: str | None = None) -> str | None:
         with self.connect() as conn:
             row = conn.execute(
@@ -186,6 +262,34 @@ class Database:
 
     def set_single_file_mode(self, enabled: bool) -> None:
         self.set_setting("single_file_mode", "1" if enabled else "0")
+
+    def maintenance_mode_enabled(self) -> bool:
+        return self.get_setting("maintenance_mode", "0") == "1"
+
+    def set_maintenance_mode(self, enabled: bool) -> None:
+        self.set_setting("maintenance_mode", "1" if enabled else "0")
+
+    def spoiler_mode_enabled(self) -> bool:
+        return self.get_setting("spoiler_mode", "0") == "1"
+
+    def set_spoiler_mode(self, enabled: bool) -> None:
+        self.set_setting("spoiler_mode", "1" if enabled else "0")
+
+    def referral_mode_enabled(self) -> bool:
+        return self.get_setting("referral_mode", "0") == "1"
+
+    def set_referral_mode(self, enabled: bool) -> None:
+        self.set_setting("referral_mode", "1" if enabled else "0")
+
+    def referral_bonus(self) -> int:
+        value = self.get_setting("referral_bonus_requests", "5") or "5"
+        try:
+            return max(0, int(value))
+        except ValueError:
+            return 5
+
+    def set_referral_bonus(self, amount: int) -> None:
+        self.set_setting("referral_bonus_requests", str(max(0, amount)))
 
     def delete_timer_seconds(self) -> int:
         value = self.get_setting("delete_timer_seconds", "0") or "0"
@@ -278,6 +382,20 @@ class Database:
                 (int(blocked), to_db_time(), user_id),
             )
 
+    def ensure_user_record(self, user_id: int) -> None:
+        now = to_db_time()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO users (
+                    user_id, username, first_name, last_name, is_bot, is_blocked,
+                    first_seen, last_seen
+                )
+                VALUES (?, NULL, NULL, NULL, 0, 0, ?, ?)
+                """,
+                (user_id, now, now),
+            )
+
     def is_sudo(self, user_id: int) -> bool:
         with self.connect() as conn:
             row = conn.execute(
@@ -305,6 +423,66 @@ class Database:
         with self.connect() as conn:
             rows = conn.execute("SELECT user_id FROM sudo_users ORDER BY user_id").fetchall()
             return [int(row["user_id"]) for row in rows]
+
+    def is_privileged(self, user_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM privileged_users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return row is not None
+
+    def add_privileged(self, user_id: int, added_by: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO privileged_users (user_id, added_by, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (user_id, added_by, to_db_time()),
+            )
+
+    def remove_privileged(self, user_id: int) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM privileged_users WHERE user_id = ?",
+                (user_id,),
+            )
+            return cursor.rowcount > 0
+
+    def list_privileged(self) -> list[int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT user_id FROM privileged_users ORDER BY user_id"
+            ).fetchall()
+            return [int(row["user_id"]) for row in rows]
+
+    def bonus_requests(self, user_id: int) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT bonus_requests FROM user_bonuses WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return int(row["bonus_requests"]) if row else 0
+
+    def add_bonus_requests(self, user_id: int, amount: int) -> int:
+        amount = max(0, amount)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_bonuses (user_id, bonus_requests, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    bonus_requests = bonus_requests + excluded.bonus_requests,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, amount, to_db_time()),
+            )
+            row = conn.execute(
+                "SELECT bonus_requests FROM user_bonuses WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return int(row["bonus_requests"]) if row else 0
 
     def add_file(self, file_id: str, file_type: str, label: str | None, added_by: int) -> None:
         with self.connect() as conn:
@@ -373,10 +551,35 @@ class Database:
             params.append(file_type)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connect() as conn:
-            row = conn.execute(
-                f"SELECT * FROM indexed_files {where} ORDER BY RANDOM() LIMIT 1",
+            bounds = conn.execute(
+                f"SELECT MIN(id) AS min_id, MAX(id) AS max_id FROM indexed_files {where}",
                 params,
             ).fetchone()
+            if not bounds or bounds["min_id"] is None or bounds["max_id"] is None:
+                return None
+            min_id = int(bounds["min_id"])
+            max_id = int(bounds["max_id"])
+            row = None
+            span = max(1, max_id - min_id + 1)
+            for _ in range(3):
+                pivot = min_id + (abs(conn.execute("SELECT random()").fetchone()[0]) % span)
+                row = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM indexed_files
+                    {where + ' AND' if where else 'WHERE'} id >= ?
+                    ORDER BY id
+                    LIMIT 1
+                    """,
+                    [*params, pivot],
+                ).fetchone()
+                if row:
+                    break
+            if not row:
+                row = conn.execute(
+                    f"SELECT * FROM indexed_files {where} ORDER BY id LIMIT 1",
+                    params,
+                ).fetchone()
             return self._file_from_row(row) if row else None
 
     def random_files(self, limit: int = 100) -> list[IndexedFile]:
@@ -469,6 +672,129 @@ class Database:
                     user_id,
                 ),
             )
+
+    def create_referral(self, referrer_id: int, referred_id: int) -> int:
+        if referrer_id == referred_id or not self.referral_mode_enabled():
+            return 0
+        bonus = self.referral_bonus()
+        if bonus <= 0:
+            return 0
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM referrals WHERE referred_id = ?",
+                (referred_id,),
+            ).fetchone()
+            if existing:
+                return 0
+            conn.execute(
+                """
+                INSERT INTO referrals (referred_id, referrer_id, bonus_awarded, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (referred_id, referrer_id, bonus, to_db_time()),
+            )
+            conn.execute(
+                """
+                INSERT INTO user_bonuses (user_id, bonus_requests, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    bonus_requests = bonus_requests + excluded.bonus_requests,
+                    updated_at = excluded.updated_at
+                """,
+                (referrer_id, bonus, to_db_time()),
+            )
+            return bonus
+
+    def referral_count(self, referrer_id: int) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM referrals WHERE referrer_id = ?",
+                (referrer_id,),
+            ).fetchone()
+            return int(row["count"])
+
+    def create_promo_code(
+        self,
+        code: str,
+        *,
+        bonus_requests: int,
+        max_uses: int,
+        expires_at: datetime | None,
+        created_by: int,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO promo_codes (
+                    code, bonus_requests, max_uses, uses, expires_at, created_by, created_at
+                )
+                VALUES (?, ?, ?, 0, ?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    bonus_requests = excluded.bonus_requests,
+                    max_uses = excluded.max_uses,
+                    uses = 0,
+                    expires_at = excluded.expires_at,
+                    created_by = excluded.created_by,
+                    created_at = excluded.created_at
+                """
+                ,
+                (
+                    code,
+                    max(0, bonus_requests),
+                    max(1, max_uses),
+                    to_db_time(expires_at) if expires_at else None,
+                    created_by,
+                    to_db_time(),
+                ),
+            )
+
+    def redeem_promo_code(self, code: str, user_id: int) -> tuple[bool, str, int]:
+        now = utcnow()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM promo_codes WHERE lower(code) = lower(?)",
+                (code,),
+            ).fetchone()
+            if not row:
+                return False, "That promo code does not exist.", 0
+            expires_at = from_db_time(row["expires_at"])
+            if expires_at and expires_at <= now:
+                return False, "That promo code has expired.", 0
+            if int(row["uses"]) >= int(row["max_uses"]):
+                return False, "That promo code has already been fully redeemed.", 0
+            used = conn.execute(
+                "SELECT 1 FROM promo_redemptions WHERE code = ? AND user_id = ?",
+                (row["code"], user_id),
+            ).fetchone()
+            if used:
+                return False, "You have already redeemed that promo code.", 0
+            bonus = int(row["bonus_requests"])
+            conn.execute(
+                """
+                INSERT INTO promo_redemptions (code, user_id, redeemed_at)
+                VALUES (?, ?, ?)
+                """,
+                (row["code"], user_id, to_db_time(now)),
+            )
+            conn.execute(
+                "UPDATE promo_codes SET uses = uses + 1 WHERE code = ?",
+                (row["code"],),
+            )
+            conn.execute(
+                """
+                INSERT INTO user_bonuses (user_id, bonus_requests, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    bonus_requests = bonus_requests + excluded.bonus_requests,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, bonus, to_db_time(now)),
+            )
+            total = conn.execute(
+                "SELECT bonus_requests FROM user_bonuses WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return True, "Promo code redeemed.", int(total["bonus_requests"]) if total else bonus
 
     def record_denied(self, user_id: int, event_type: str = "denied") -> None:
         with self.connect() as conn:
@@ -590,6 +916,68 @@ class Database:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
             return self._user_from_row(row) if row else None
+
+    def all_user_stats(self) -> list[UserStats]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM users ORDER BY first_seen DESC"
+            ).fetchall()
+            return [self._user_from_row(row) for row in rows]
+
+    def user_export_records(self) -> list[dict[str, object]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    u.user_id,
+                    u.username,
+                    u.first_name,
+                    u.last_name,
+                    u.is_blocked,
+                    u.request_count,
+                    u.refresh_count,
+                    u.denied_count,
+                    u.files_sent,
+                    u.first_seen,
+                    u.last_seen,
+                    u.last_request_at,
+                    COALESCE(b.bonus_requests, 0) AS bonus_requests,
+                    CASE WHEN s.user_id IS NULL THEN 0 ELSE 1 END AS is_sudo,
+                    CASE WHEN p.user_id IS NULL THEN 0 ELSE 1 END AS is_privileged,
+                    COALESCE(r.referrals, 0) AS referrals
+                FROM users u
+                LEFT JOIN user_bonuses b ON b.user_id = u.user_id
+                LEFT JOIN sudo_users s ON s.user_id = u.user_id
+                LEFT JOIN privileged_users p ON p.user_id = u.user_id
+                LEFT JOIN (
+                    SELECT referrer_id, COUNT(*) AS referrals
+                    FROM referrals
+                    GROUP BY referrer_id
+                ) r ON r.referrer_id = u.user_id
+                ORDER BY u.first_seen DESC
+                """
+            ).fetchall()
+            return [
+                {
+                    "user_id": int(row["user_id"]),
+                    "username": row["username"],
+                    "first_name": row["first_name"],
+                    "last_name": row["last_name"],
+                    "is_blocked": bool(row["is_blocked"]),
+                    "request_count": int(row["request_count"]),
+                    "refresh_count": int(row["refresh_count"]),
+                    "denied_count": int(row["denied_count"]),
+                    "files_sent": int(row["files_sent"]),
+                    "bonus_requests": int(row["bonus_requests"]),
+                    "is_sudo": bool(row["is_sudo"]),
+                    "is_privileged": bool(row["is_privileged"]),
+                    "referrals": int(row["referrals"]),
+                    "first_seen": row["first_seen"],
+                    "last_seen": row["last_seen"],
+                    "last_request_at": row["last_request_at"],
+                }
+                for row in rows
+            ]
 
     def recent_membership_events(self, limit: int = 15) -> list[MembershipEvent]:
         with self.connect() as conn:

@@ -61,6 +61,8 @@ docker run -d --name random-file-bot `
 - `/start` - open the bot and request a random file.
 - `/random` or `/get` - request a random file.
 - `/stats` - show your usage stats.
+- `/refer` - create your referral link when referrals are enabled.
+- `/redeem <code>` - redeem a promo code for extra requests.
 - `/help` - show user help, or the admin manual for owner/sudo users.
 
 Every sent file includes a refresh button. Pressing it edits the same message with another random file when Telegram allows that media edit.
@@ -76,10 +78,15 @@ Inline usage uses the same request limit as `/random` and refresh clicks.
 The owner is configured with `OWNER_ID`. Sudo users have the same bot-management permissions.
 
 - `/admin` - usage dashboard.
-- `/help` - detailed admin command guide with examples.
+- `/help` - paginated admin command guide with callback buttons.
 - `/exportdb` - export the full SQLite database for migration or backup.
+- `/importdb` - import a SQLite database previously exported by `/exportdb`.
+- `/maintenance [on|off|status]` - make the bot silently unavailable to non-admin users while owner/sudo users can keep operating.
+- `/spoiler [on|off|status]` - send supported media with Telegram's spoiler effect.
 - `/singlemode [on|off|status]` - toggle one-active-file-message mode per user.
 - `/deletetimer <time|off>` - reset/delete non-admin file messages after a custom interval. Examples: `/deletetimer 30s`, `/deletetimer 10m`, `/deletetimer 1h`, `/deletetimer off`.
+- `/referrals [on|off|status] [bonus n]` - toggle referral rewards and set how many bonus requests each accepted referral adds.
+- `/promo <bonus_requests> <max_uses> [expiry] [code]` - create a promo code for `/redeem`. Expiry accepts values like `1h`, `2d`, or can be omitted.
 - `/addfile <file_id> [label]` - add a Telegram file ID as a document.
 - `/addfile <type> <file_id> [label]` - add a typed file ID. Types: `document`, `photo`, `video`, `audio`, `animation`.
 - `/addfile` as a reply to a document/video/audio/photo/animation message - index that media.
@@ -88,21 +95,33 @@ The owner is configured with `OWNER_ID`. Sudo users have the same bot-management
 - `/delfile <file_id>` - remove a file ID.
 - `/files` - show indexed file count and recent entries.
 - `/users` - list recent users.
+- `/users -full -txt` - export full user info and stats as text.
+- `/users -full -json` - export full user info and stats as JSON.
 - `/blocked` - list users marked as having blocked the bot.
 - `/membership` - show recent join request and membership updates.
 - `/broadcast <text>` - send a text broadcast to known active users.
 - `/addsudo <user_id>` - grant sudo access.
 - `/delsudo <user_id>` - revoke sudo access.
-- `/sudos` - list sudo users.
+- `/sudos` - list sudo users with Telegram mentions when known.
+- `/addpriv <user_id>` - add an unlimited user with no admin permissions.
+- `/delpriv <user_id>` - remove unlimited-user status.
+- `/privs` - list unlimited users.
 - `/addfsub <chat_id|@username> [invite_link] [title]` - require membership in a chat/channel.
 - `/addreqfsub <chat_id|@username> [invite_link] [title]` - require the user to send a join request to a chat/channel.
 - `/delfsub <chat_id|@username>` - remove a force-sub chat.
 - `/fsubs` - list force-sub chats.
 - `/user <user_id>` - inspect a user's usage and status.
+- `/setbot <name|about|description|username> <text>` - update bot profile fields from Telegram.
+- `/delbot <name|about|description|username|botpic>` - clear supported bot profile fields.
+- `/setbotpic` as a reply to a photo - update the bot profile picture.
 
 `/singlemode` makes each user keep only one active file message at a time. When a new draw is shown, the bot tries to revert the previous file message back to the `/start` prompt; if Telegram will not convert that media message back to text, the bot deletes the old file message instead.
 
 `/deletetimer` applies only to non-owner/non-sudo users and only to file messages sent by the bot. If single-message mode is on, only the user's current active file message is affected. If it is off, each sent file message gets its own timer.
+
+`/maintenance on` is meant for backups, imports, and operational work. While it is enabled, non-admin users get no bot responses; owner and sudo users can still use admin commands such as `/exportdb`, `/importdb`, and `/maintenance off`.
+
+Referral and promo bonuses are additive on top of `REQUEST_LIMIT`. Sudo users and `/addpriv` users are unlimited but still counted in user statistics.
 
 ## Force Subscribe Notes
 
