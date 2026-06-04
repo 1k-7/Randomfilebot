@@ -61,6 +61,8 @@ The owner is configured with `OWNER_ID`. Sudo users have the same bot-management
 - `/addfile <file_id> [label]` - add a Telegram file ID as a document.
 - `/addfile <type> <file_id> [label]` - add a typed file ID. Types: `document`, `photo`, `video`, `audio`, `animation`.
 - `/addfile` as a reply to a document/video/audio/photo/animation message - index that media.
+- `/importjson` as a reply to a JSON document - import file IDs from JSON.
+- `/importjson replace` as a reply to a JSON document - replace the indexed-file DB from JSON.
 - `/delfile <file_id>` - remove a file ID.
 - `/files` - show indexed file count and recent entries.
 - `/users` - list recent users.
@@ -84,3 +86,14 @@ If a required chat uses join requests, approve the user in Telegram or through y
 ## File IDs
 
 Telegram `file_id`s are bot-specific enough that you should index media using this bot where possible. Replying to a media message with `/addfile` is the easiest path.
+
+JSON imports accept either one object or a list of objects. `_id` is used as the Telegram file ID, and `caption` or `file_name` becomes the label:
+
+```json
+{
+  "_id": "BQACAgQAAyEFAAS_JUKvAAMeahiOUkOLWJblmwQl8K-xcXrghiMAAgYZAAJnLchTXODWcRkTgbkeBA",
+  "file_name": "Forbidden Desire 03 Crazydad3D zip",
+  "file_size": 53713452,
+  "caption": "Forbidden Desire 03 [Crazydad3D] zip"
+}
+```

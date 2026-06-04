@@ -195,6 +195,32 @@ class Database:
                 (file_id, file_type, label, added_by, to_db_time()),
             )
 
+    def import_files(
+        self,
+        files: list[tuple[str, str, str | None]],
+        *,
+        added_by: int,
+        replace: bool = False,
+    ) -> int:
+        now = to_db_time()
+        with self.connect() as conn:
+            if replace:
+                conn.execute("DELETE FROM indexed_files")
+            conn.executemany(
+                """
+                INSERT INTO indexed_files (file_id, file_type, label, added_by, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(file_id) DO UPDATE SET
+                    file_type = excluded.file_type,
+                    label = COALESCE(excluded.label, indexed_files.label)
+                """,
+                [
+                    (file_id, file_type, label, added_by, now)
+                    for file_id, file_type, label in files
+                ],
+            )
+            return len(files)
+
     def remove_file(self, file_id: str) -> bool:
         with self.connect() as conn:
             cursor = conn.execute("DELETE FROM indexed_files WHERE file_id = ?", (file_id,))

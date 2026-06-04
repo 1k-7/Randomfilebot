@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import logging
 from datetime import timedelta
 from html import escape
@@ -450,6 +452,88 @@ async def add_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+async def import_json_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await track_user(update, context)
+    if not await require_sudo(update, context):
+        return
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    document = message.reply_to_message.document if message.reply_to_message else None
+    if not document:
+        await message.reply_text("Reply to a JSON document with /importjson or /importjson replace.")
+        return
+    file_name = document.file_name or ""
+    if file_name and not file_name.lower().endswith(".json"):
+        await message.reply_text("That does not look like a .json file.")
+        return
+    replace = bool(context.args and context.args[0].lower() == "replace")
+    try:
+        telegram_file = await document.get_file()
+        buffer = io.BytesIO()
+        await telegram_file.download_to_memory(out=buffer)
+        payload = json.loads(buffer.getvalue().decode("utf-8-sig"))
+        files, skipped = parse_import_payload(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        await message.reply_text("I could not parse that file as valid UTF-8 JSON.")
+        return
+    except TelegramError:
+        await message.reply_text("Telegram would not let me download that JSON file.")
+        return
+    if not files:
+        await message.reply_text("No importable file records found. Each record needs an _id file ID.")
+        return
+    imported = runtime(context).db.import_files(files, added_by=user.id, replace=replace)
+    mode = "Replaced the indexed-file DB with" if replace else "Imported"
+    await message.reply_text(
+        (
+            f"{mode} <b>{imported}</b> files from JSON.\n"
+            f"Skipped records: <b>{skipped}</b>."
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+def parse_import_payload(payload) -> tuple[list[tuple[str, str, str | None]], int]:
+    if isinstance(payload, dict) and "_id" in payload:
+        records = [payload]
+    elif isinstance(payload, list):
+        records = payload
+    elif isinstance(payload, dict):
+        records = next(
+            (value for value in payload.values() if isinstance(value, list)),
+            [],
+        )
+    else:
+        records = []
+
+    files: list[tuple[str, str, str | None]] = []
+    skipped = 0
+    seen: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            skipped += 1
+            continue
+        file_id = record.get("_id") or record.get("file_id") or record.get("id")
+        if not isinstance(file_id, str) or not file_id.strip():
+            skipped += 1
+            continue
+        file_id = file_id.strip()
+        if file_id in seen:
+            skipped += 1
+            continue
+        seen.add(file_id)
+
+        raw_type = str(record.get("file_type") or record.get("type") or "document").lower()
+        file_type = raw_type if raw_type in SUPPORTED_FILE_TYPES else "document"
+        label = record.get("caption") or record.get("file_name") or record.get("name")
+        if label is not None:
+            label = str(label).strip() or None
+        files.append((file_id, file_type, label))
+    return files, skipped
+
+
 def extract_replied_media(message) -> tuple[str, str, str | None] | None:
     reply = message.reply_to_message
     if not reply:
@@ -791,6 +875,7 @@ def build_application(config: Config, db: Database) -> Application:
     application.add_handler(CommandHandler("blocked", blocked_command))
     application.add_handler(CommandHandler("membership", membership_command))
     application.add_handler(CommandHandler("addfile", add_file_command))
+    application.add_handler(CommandHandler("importjson", import_json_command))
     application.add_handler(CommandHandler("delfile", del_file_command))
     application.add_handler(CommandHandler("files", files_command))
     application.add_handler(CommandHandler("addfsub", add_fsub_command))
