@@ -178,8 +178,6 @@ class Database:
                     ON indexed_files (file_type, id);
                 CREATE INDEX IF NOT EXISTS idx_referrals_referrer
                     ON referrals (referrer_id);
-                CREATE INDEX IF NOT EXISTS idx_referrals_pending
-                    ON referrals (referred_id, fulfilled);
                 CREATE INDEX IF NOT EXISTS idx_promo_expires
                     ON promo_codes (expires_at);
                 """
@@ -201,6 +199,12 @@ class Database:
                 "referrals",
                 "fulfilled_at",
                 "TEXT",
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_referrals_pending
+                    ON referrals (referred_id, fulfilled)
+                """
             )
             conn.execute(
                 "UPDATE referrals SET fulfilled = 1 WHERE bonus_awarded > 0 AND fulfilled = 0"
