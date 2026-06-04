@@ -3,9 +3,14 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DATABASE_PATH=/data/bot.sqlite3 \
-    SESSION_WORKDIR=/data
+    SESSION_WORKDIR=/data \
+    MAX_CONCURRENT_TRANSMISSIONS=4
 
 WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --shell /usr/sbin/nologin botuser \
     && mkdir -p /data \

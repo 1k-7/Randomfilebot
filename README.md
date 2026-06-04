@@ -14,6 +14,8 @@ A Telegram bot built on Pyroblack/Pyrogram that sends a random indexed file by T
    pip install -r requirements.txt
    ```
 
+   `TgCrypto` is included because Pyroblack/Pyrogram downloads are much slower without its native crypto speedup.
+
 4. Copy `.env.example` to `.env` and set:
 
    - `BOT_TOKEN`: your Telegram bot token.
@@ -23,6 +25,7 @@ A Telegram bot built on Pyroblack/Pyrogram that sends a random indexed file by T
    - `DATABASE_PATH`: optional SQLite path.
    - `SESSION_NAME`: optional Pyroblack session name.
    - `SESSION_WORKDIR`: optional directory for the Pyroblack session file.
+   - `MAX_CONCURRENT_TRANSMISSIONS`: optional Pyroblack transfer concurrency, defaults to `4`.
    - `REQUEST_LIMIT`: optional, defaults to `30`.
    - `REQUEST_WINDOW_MINUTES`: optional, defaults to `60`.
 
@@ -48,6 +51,7 @@ docker run -d --name random-file-bot `
   -e API_ID=123456 `
   -e API_HASH=replace-me `
   -e OWNER_ID=123456789 `
+  -e MAX_CONCURRENT_TRANSMISSIONS=4 `
   -v random-file-bot-data:/data `
   random-file-bot
 ```
@@ -96,7 +100,7 @@ Telegram `file_id`s are bot-specific enough that you should index media using th
 
 JSON imports accept either one object or a list of objects. `_id` is used as the Telegram file ID, and `caption` or `file_name` becomes the label:
 
-Large JSON files are downloaded to a temporary file first, with progress shown in Telegram, then parsed and written to SQLite.
+Large JSON files are downloaded to a temporary file first, with progress shown in Telegram, then parsed and written to SQLite. Progress message edits are scheduled in the background so they do not block the download loop.
 
 ```json
 {

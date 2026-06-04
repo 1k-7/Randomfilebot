@@ -15,6 +15,7 @@ class Config:
     database_path: str
     session_name: str
     session_workdir: str
+    max_concurrent_transmissions: int
     request_limit: int
     request_window_seconds: int
 
@@ -36,6 +37,7 @@ def load_config() -> Config:
         database_path=os.getenv("DATABASE_PATH", "bot.sqlite3"),
         session_name=os.getenv("SESSION_NAME", "random_file_bot"),
         session_workdir=os.getenv("SESSION_WORKDIR", "."),
+        max_concurrent_transmissions=int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "4")),
         request_limit=int(os.getenv("REQUEST_LIMIT", "30")),
         request_window_seconds=int(os.getenv("REQUEST_WINDOW_MINUTES", "60")) * 60,
     )

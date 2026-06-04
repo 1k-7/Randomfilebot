@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import tempfile
+from contextlib import suppress
 from datetime import timedelta
 from html import escape
 
@@ -397,12 +398,16 @@ async def import_json_command(client: Client, rt: BotRuntime, message: Message) 
     downloaded_path: str | None = None
     try:
         temp_path = os.path.join(temp_dir, "import.json")
-        progress_state = {"last_edit": 0.0}
+        progress_state = {"last_edit": 0.0, "pending": None}
         downloaded_path = await source.download(
             file_name=temp_path,
             progress=download_progress,
             progress_args=(status, progress_state),
         )
+        pending = progress_state.get("pending")
+        if isinstance(pending, asyncio.Task):
+            with suppress(Exception):
+                await pending
         if not downloaded_path:
             await status.edit_text("Import failed: Telegram did not return a downloaded file path.")
             return
@@ -466,9 +471,12 @@ async def import_json_command(client: Client, rt: BotRuntime, message: Message) 
     )
 
 
-async def download_progress(current: int, total: int, status: Message, state: dict[str, float]) -> None:
+async def download_progress(current: int, total: int, status: Message, state: dict[str, object]) -> None:
     loop_time = asyncio.get_running_loop().time()
     if current < total and loop_time - state["last_edit"] < 5:
+        return
+    pending = state.get("pending")
+    if isinstance(pending, asyncio.Task) and not pending.done():
         return
     state["last_edit"] = loop_time
     if total:
@@ -483,6 +491,10 @@ async def download_progress(current: int, total: int, status: Message, state: di
             "<b>JSON import in progress.</b>\n\n"
             f"Downloading: <b>{current / 1024 / 1024:.1f} MB</b>"
         )
+    state["pending"] = asyncio.create_task(edit_download_status(status, text))
+
+
+async def edit_download_status(status: Message, text: str) -> None:
     try:
         await status.edit_text(text, parse_mode=ParseMode.HTML)
     except RPCError:
@@ -574,6 +586,7 @@ def build_client(config: Config, db: Database) -> Client:
         bot_token=config.bot_token,
         workdir=config.session_workdir,
         parse_mode=ParseMode.HTML,
+        max_concurrent_transmissions=config.max_concurrent_transmissions,
     )
     rt = BotRuntime(config, db)
 
