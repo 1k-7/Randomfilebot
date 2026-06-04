@@ -224,6 +224,13 @@ class Database:
             cursor = conn.execute("DELETE FROM indexed_files WHERE file_id = ?", (file_id,))
             return cursor.rowcount > 0
 
+    def update_file_type(self, file_db_id: int, file_type: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE indexed_files SET file_type = ? WHERE id = ?",
+                (file_type, file_db_id),
+            )
+
     def random_file(self, *, exclude_id: int | None = None) -> IndexedFile | None:
         with self.connect() as conn:
             if exclude_id is not None:

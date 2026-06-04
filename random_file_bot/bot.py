@@ -7,12 +7,14 @@ import os
 import re
 import tempfile
 from contextlib import suppress
+from dataclasses import replace
 from datetime import timedelta
 from html import escape
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.errors import RPCError
+from pyrogram.file_id import FileId, FileType
 from pyrogram.types import (
     CallbackQuery,
     ChatJoinRequest,
@@ -34,6 +36,14 @@ from .models import ForceSubChat, IndexedFile, UserStats
 
 REFRESH_CALLBACK = "refresh_file"
 SUPPORTED_FILE_TYPES = {"document", "photo", "video", "audio", "animation"}
+PYROGRAM_FILE_TYPE_MAP = {
+    FileType.PHOTO: "photo",
+    FileType.VIDEO: "video",
+    FileType.AUDIO: "audio",
+    FileType.ANIMATION: "animation",
+    FileType.DOCUMENT: "document",
+    FileType.DOCUMENT_AS_FILE: "document",
+}
 MEMBER_STATUSES = {"owner", "creator", "administrator", "member"}
 
 
@@ -130,6 +140,36 @@ def is_block_error(error: RPCError) -> bool:
         or "USER_IS_BLOCKED" in text
         or "PEER_ID_INVALID" in text
     )
+
+
+def detect_file_type(file_id: str, declared_type: str | None = None) -> str:
+    try:
+        decoded = FileId.decode(file_id)
+        mapped = PYROGRAM_FILE_TYPE_MAP.get(decoded.file_type)
+        if mapped:
+            return mapped
+    except Exception:
+        pass
+    if declared_type and declared_type.lower() in SUPPORTED_FILE_TYPES:
+        return declared_type.lower()
+    return "document"
+
+
+def file_type_from_mismatch(error: Exception) -> str | None:
+    match = re.search(r"got\s+([A-Z_]+)\s+file id", str(error), flags=re.IGNORECASE)
+    if not match:
+        return None
+    value = match.group(1).lower()
+    if value == "document_as_file":
+        return "document"
+    return value if value in SUPPORTED_FILE_TYPES else None
+
+
+def correct_file_type(rt: BotRuntime, item: IndexedFile, file_type: str) -> IndexedFile:
+    if file_type == item.file_type:
+        return item
+    rt.db.update_file_type(item.id, file_type)
+    return replace(item, file_type=file_type)
 
 
 async def require_sudo(rt: BotRuntime, message: Message) -> bool:
@@ -289,10 +329,10 @@ async def refresh_random_file(
         return
     await query.answer("Drawing another file...")
     try:
-        await edit_message_media(query, item)
+        await edit_message_media(rt, query, item)
         rt.db.record_file_event(user.id, item.id, event_type)
         return
-    except RPCError:
+    except (RPCError, ValueError):
         try:
             await query.message.delete()
         except RPCError:
@@ -329,14 +369,24 @@ async def edit_query_text_or_caption(
         )
 
 
-async def edit_message_media(query: CallbackQuery, item: IndexedFile) -> None:
+async def edit_message_media(rt: BotRuntime, query: CallbackQuery, item: IndexedFile) -> None:
     message = query.message
     if not message:
         return
-    await message.edit_media(
-        media=input_media_for(item),
-        reply_markup=refresh_keyboard(item.id),
-    )
+    try:
+        await message.edit_media(
+            media=input_media_for(item),
+            reply_markup=refresh_keyboard(item.id),
+        )
+    except ValueError as error:
+        corrected_type = file_type_from_mismatch(error) or detect_file_type(item.file_id, item.file_type)
+        if corrected_type == item.file_type:
+            raise
+        corrected = correct_file_type(rt, item, corrected_type)
+        await message.edit_media(
+            media=input_media_for(corrected),
+            reply_markup=refresh_keyboard(corrected.id),
+        )
 
 
 def input_media_for(item: IndexedFile):
@@ -353,22 +403,13 @@ def input_media_for(item: IndexedFile):
 
 
 async def send_file_message(client: Client, chat_id: int, item: IndexedFile) -> None:
-    kwargs = {
-        "chat_id": chat_id,
-        "caption": file_caption(item),
-        "parse_mode": ParseMode.HTML,
-        "reply_markup": refresh_keyboard(item.id),
-    }
-    if item.file_type == "photo":
-        await client.send_photo(photo=item.file_id, **kwargs)
-    elif item.file_type == "video":
-        await client.send_video(video=item.file_id, **kwargs)
-    elif item.file_type == "audio":
-        await client.send_audio(audio=item.file_id, **kwargs)
-    elif item.file_type == "animation":
-        await client.send_animation(animation=item.file_id, **kwargs)
-    else:
-        await client.send_document(document=item.file_id, **kwargs)
+    await client.send_cached_media(
+        chat_id=chat_id,
+        file_id=item.file_id,
+        caption=file_caption(item),
+        parse_mode=ParseMode.HTML,
+        reply_markup=refresh_keyboard(item.id),
+    )
 
 
 async def import_json_command(client: Client, rt: BotRuntime, message: Message) -> None:
@@ -537,8 +578,8 @@ def parse_import_payload(payload) -> tuple[list[tuple[str, str, str | None]], in
             continue
         seen.add(file_id)
 
-        raw_type = str(record.get("file_type") or record.get("type") or "document").lower()
-        file_type = raw_type if raw_type in SUPPORTED_FILE_TYPES else "document"
+        raw_type = str(record.get("file_type") or record.get("type") or "").lower()
+        file_type = detect_file_type(file_id, raw_type)
         label = record.get("caption") or record.get("file_name") or record.get("name")
         if label is not None:
             label = str(label).strip() or None
