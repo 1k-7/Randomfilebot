@@ -75,6 +75,7 @@ Inline usage uses the same request limit as `/random` and refresh clicks.
 The owner is configured with `OWNER_ID`. Sudo users have the same bot-management permissions.
 
 - `/admin` - usage dashboard.
+- `/exportdb` - export the full SQLite database for migration or backup.
 - `/addfile <file_id> [label]` - add a Telegram file ID as a document.
 - `/addfile <type> <file_id> [label]` - add a typed file ID. Types: `document`, `photo`, `video`, `audio`, `animation`.
 - `/addfile` as a reply to a document/video/audio/photo/animation message - index that media.

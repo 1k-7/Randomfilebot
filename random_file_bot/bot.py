@@ -470,6 +470,65 @@ async def send_file_message(client: Client, chat_id: int, item: IndexedFile) -> 
     )
 
 
+async def export_db_command(client: Client, rt: BotRuntime, message: Message) -> None:
+    await track_user(rt, message.from_user)
+    if not await require_sudo(rt, message):
+        return
+    status = await message.reply_text(
+        "<b>Database export started.</b>\n\nCreating a live SQLite backup...",
+        parse_mode=ParseMode.HTML,
+    )
+    temp_dir = tempfile.mkdtemp(prefix="random-file-bot-db-")
+    backup_path: str | None = None
+    try:
+        timestamp = utcnow().strftime("%Y%m%d-%H%M%S")
+        backup_path = os.path.join(temp_dir, f"random-file-bot-backup-{timestamp}.sqlite3")
+        await asyncio.to_thread(rt.db.backup_to, backup_path)
+        backup_size = os.path.getsize(backup_path)
+        await status.edit_text(
+            (
+                "<b>Database export ready.</b>\n\n"
+                f"Size: <b>{backup_size / 1024 / 1024:.2f} MB</b>\n"
+                "Uploading backup file..."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        await client.send_document(
+            chat_id=message.chat.id,
+            document=backup_path,
+            caption=(
+                "<b>Full database backup</b>\n\n"
+                "This SQLite file contains all bot tables, including indexed files, users, "
+                "force-sub chats, sudo users, usage events, and membership logs."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=message.id,
+        )
+        await status.edit_text(
+            "<b>Database export complete.</b>\n\nThe backup file was sent above.",
+            parse_mode=ParseMode.HTML,
+        )
+    except RPCError:
+        logging.exception("Telegram rejected database export upload")
+        await status.edit_text("Telegram would not let me send the database backup.")
+    except Exception as error:
+        logging.exception("Database export failed")
+        await status.edit_text(
+            f"Export failed: <code>{escape(error.__class__.__name__)}</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+    finally:
+        if backup_path and os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+            except OSError:
+                pass
+        try:
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
+
+
 async def import_json_command(client: Client, rt: BotRuntime, message: Message) -> None:
     await track_user(rt, message.from_user)
     if not await require_sudo(rt, message):
@@ -805,6 +864,10 @@ def build_client(config: Config, db: Database) -> Client:
             ),
             parse_mode=ParseMode.HTML,
         )
+
+    @app.on_message(filters.command("exportdb"))
+    async def export_db(client: Client, message: Message) -> None:
+        await export_db_command(client, rt, message)
 
     @app.on_message(filters.command("addfile"))
     async def add_file_command(client: Client, message: Message) -> None:

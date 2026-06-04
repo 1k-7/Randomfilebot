@@ -115,6 +115,17 @@ class Database:
                 (owner_id, owner_id, to_db_time()),
             )
 
+    def backup_to(self, destination_path: str | Path) -> None:
+        destination_path = Path(destination_path)
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as source:
+            destination = sqlite3.connect(destination_path)
+            try:
+                source.backup(destination)
+                destination.commit()
+            finally:
+                destination.close()
+
     def upsert_user(self, user, *, blocked: bool = False) -> None:
         now = to_db_time()
         with self.connect() as conn:
