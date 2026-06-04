@@ -383,42 +383,57 @@ def cancel_all_delete_tasks(rt: BotRuntime) -> None:
 
 async def reset_file_message_to_start(
     client: Client,
+    rt: BotRuntime,
     *,
     user_name: str | None,
     chat_id: int,
     message_id: int,
 ) -> bool:
+    start_img = rt.db.get_setting("start_image_id")
+    text = sleek_title(user_name)
     try:
-        await client.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=sleek_title(user_name),
-            parse_mode=ParseMode.HTML,
-            reply_markup=start_keyboard(),
-            disable_web_page_preview=True,
-        )
-        # Some Telegram clients may accept the edit but leave media in place
-        # (resulting in a caption change instead of conversion to a text message).
-        # Detect that case and delete the message instead, matching the intended
-        # single-mode behavior described in README.
-        try:
-            msg = await client.get_messages(chat_id, message_id)
-            if msg is not None and any(
-                getattr(msg, attr, None)
-                for attr in ("photo", "video", "audio", "document", "animation")
-            ):
-                with suppress(RPCError):
-                    await client.delete_messages(chat_id=chat_id, message_ids=message_id)
-                return True
-        except RPCError:
-            # If we can't fetch the message, fall through and treat edit as success.
-            pass
+        if start_img:
+            await client.edit_message_media(
+                chat_id=chat_id,
+                message_id=message_id,
+                media=InputMediaPhoto(
+                    media=start_img,
+                    caption=text,
+                    parse_mode=ParseMode.HTML
+                ),
+                reply_markup=start_keyboard()
+            )
+        else:
+            await client.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=start_keyboard(),
+                disable_web_page_preview=True,
+            )
         return True
     except RPCError:
         pass
 
     try:
         await client.delete_messages(chat_id=chat_id, message_ids=message_id)
+        if start_img:
+            await client.send_photo(
+                chat_id=chat_id,
+                photo=start_img,
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=start_keyboard()
+            )
+        else:
+            await client.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=start_keyboard(),
+                disable_web_page_preview=True,
+            )
         return True
     except RPCError:
         return False
@@ -438,6 +453,7 @@ async def reset_previous_active_file_message(
     cancel_delete_task(rt, chat_id, message_id)
     await reset_file_message_to_start(
         client,
+        rt,
         user_name=getattr(user, "first_name", None),
         chat_id=chat_id,
         message_id=message_id,
@@ -509,6 +525,7 @@ async def expire_file_message_after(
             return
         await reset_file_message_to_start(
             client,
+            rt,
             user_name=user_name,
             chat_id=chat_id,
             message_id=message_id,
@@ -1148,7 +1165,9 @@ def admin_help_text(rt: BotRuntime) -> str:
         f"- /singlemode [on|off|status] - one active file message per user. Current: <b>{single_mode}</b>.\n"
         f"- /deletetimer &lt;time|off&gt; - reset/delete non-admin file messages. Current: <b>{delete_timer}</b>.\n"
         "  Examples: <code>/deletetimer 30s</code>, <code>/deletetimer 10m</code>, "
-        "<code>/deletetimer 1h</code>, <code>/deletetimer off</code>."
+        "<code>/deletetimer 1h</code>, <code>/deletetimer off</code>.\n"
+        "- /setimg - (reply to photo) set the /start menu placeholder image.\n"
+        "- /delimg - remove the /start menu placeholder image."
     )
 
 
@@ -1167,11 +1186,22 @@ def build_client(config: Config, db: Database) -> Client:
     @app.on_message(filters.command("start"))
     async def start(client: Client, message: Message) -> None:
         await track_user(rt, message.from_user)
-        await message.reply_text(
-            sleek_title(message.from_user.first_name if message.from_user else None),
-            reply_markup=start_keyboard(),
-            parse_mode=ParseMode.HTML,
-        )
+        start_img = rt.db.get_setting("start_image_id")
+        text = sleek_title(message.from_user.first_name if message.from_user else None)
+        
+        if start_img:
+            await message.reply_photo(
+                photo=start_img,
+                caption=text,
+                reply_markup=start_keyboard(),
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await message.reply_text(
+                text,
+                reply_markup=start_keyboard(),
+                parse_mode=ParseMode.HTML,
+            )
 
     @app.on_message(filters.command("help"))
     async def help_command(client: Client, message: Message) -> None:
@@ -1368,6 +1398,26 @@ def build_client(config: Config, db: Database) -> Client:
             ),
             parse_mode=ParseMode.HTML,
         )
+
+    @app.on_message(filters.command("setimg"))
+    async def set_start_image_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        reply = message.reply_to_message
+        if not reply or not reply.photo:
+            await message.reply_text("Please reply to an image message with /setimg to set the placeholder.")
+            return
+        rt.db.set_setting("start_image_id", reply.photo.file_id)
+        await message.reply_text("Start menu placeholder image set successfully.")
+
+    @app.on_message(filters.command("delimg"))
+    async def del_start_image_command(client: Client, message: Message) -> None:
+        await track_user(rt, message.from_user)
+        if not await require_sudo(rt, message):
+            return
+        rt.db.set_setting("start_image_id", "")
+        await message.reply_text("Start menu placeholder image removed. The bot will now default back to text-only.")
 
     @app.on_message(filters.command("addfile"))
     async def add_file_command(client: Client, message: Message) -> None:
