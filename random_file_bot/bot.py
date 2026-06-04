@@ -392,7 +392,6 @@ async def reset_file_message_to_start(
     start_img = rt.db.get_setting("start_image_id")
     text = sleek_title(user_name)
     try:
-<<<<<<< HEAD
         if start_img:
             await client.edit_message_media(
                 chat_id=chat_id,
@@ -413,16 +412,6 @@ async def reset_file_message_to_start(
                 reply_markup=start_keyboard(),
                 disable_web_page_preview=True,
             )
-=======
-        await client.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=sleek_title(user_name),
-            parse_mode=ParseMode.HTML,
-            reply_markup=start_keyboard(),
-            disable_web_page_preview=True,
-        )
->>>>>>> e70d3e2b49f5dd15e182517e62b1c92dd464f773
         return True
     except RPCError:
         pass
