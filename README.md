@@ -96,6 +96,8 @@ Telegram `file_id`s are bot-specific enough that you should index media using th
 
 JSON imports accept either one object or a list of objects. `_id` is used as the Telegram file ID, and `caption` or `file_name` becomes the label:
 
+Large JSON files are downloaded to a temporary file first, with progress shown in Telegram, then parsed and written to SQLite.
+
 ```json
 {
   "_id": "BQACAgQAAyEFAAS_JUKvAAMeahiOUkOLWJblmwQl8K-xcXrghiMAAgYZAAJnLchTXODWcRkTgbkeBA",

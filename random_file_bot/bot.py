@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import logging
+import os
 import re
+import tempfile
 from datetime import timedelta
 from html import escape
 
@@ -388,48 +389,110 @@ async def import_json_command(client: Client, rt: BotRuntime, message: Message) 
 
     args = command_args(message)
     replace = bool(args and args[0].lower() == "replace")
+    status = await message.reply_text(
+        "<b>JSON import started.</b>\n\nDownloading file...",
+        parse_mode=ParseMode.HTML,
+    )
+    temp_dir = tempfile.mkdtemp(prefix="random-file-bot-json-")
+    downloaded_path: str | None = None
     try:
-        buffer = await source.download(in_memory=True)
-        if not isinstance(buffer, io.BytesIO):
-            await message.reply_text("I could not download that JSON file into memory.")
+        temp_path = os.path.join(temp_dir, "import.json")
+        progress_state = {"last_edit": 0.0}
+        downloaded_path = await source.download(
+            file_name=temp_path,
+            progress=download_progress,
+            progress_args=(status, progress_state),
+        )
+        if not downloaded_path:
+            await status.edit_text("Import failed: Telegram did not return a downloaded file path.")
             return
-        buffer.seek(0)
-        payload = json.loads(buffer.read().decode("utf-8-sig"))
-        files, skipped = parse_import_payload(payload)
+        await status.edit_text(
+            "<b>JSON import in progress.</b>\n\nDownload complete. Parsing JSON...",
+            parse_mode=ParseMode.HTML,
+        )
+        files, skipped = await asyncio.to_thread(load_import_file, downloaded_path)
     except (UnicodeDecodeError, json.JSONDecodeError):
-        await message.reply_text("I could not parse that file as valid UTF-8 JSON.")
+        await status.edit_text("I could not parse that file as valid UTF-8 JSON.")
         return
     except RPCError:
-        await message.reply_text("Telegram would not let me download that JSON file.")
+        await status.edit_text("Telegram would not let me download that JSON file.")
         return
     except Exception as error:
         logging.exception("JSON import failed")
-        await message.reply_text(
+        await status.edit_text(
             f"Import failed before anything was written: <code>{escape(error.__class__.__name__)}</code>.",
             parse_mode=ParseMode.HTML,
         )
         return
+    finally:
+        if downloaded_path and os.path.exists(downloaded_path):
+            try:
+                os.remove(downloaded_path)
+            except OSError:
+                pass
+        try:
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
 
     if not files:
-        await message.reply_text("No importable file records found. Each record needs an _id file ID.")
+        await status.edit_text("No importable file records found. Each record needs an _id file ID.")
         return
+    await status.edit_text(
+        f"<b>JSON import in progress.</b>\n\nWriting <b>{len(files)}</b> file records to SQLite...",
+        parse_mode=ParseMode.HTML,
+    )
     try:
-        imported = rt.db.import_files(files, added_by=message.from_user.id, replace=replace)
+        imported = await asyncio.to_thread(
+            rt.db.import_files,
+            files,
+            added_by=message.from_user.id,
+            replace=replace,
+        )
     except Exception as error:
         logging.exception("JSON import database write failed")
-        await message.reply_text(
+        await status.edit_text(
             f"Import failed while writing the DB: <code>{escape(error.__class__.__name__)}</code>.",
             parse_mode=ParseMode.HTML,
         )
         return
     mode = "Replaced the indexed-file DB with" if replace else "Imported"
-    await message.reply_text(
+    await status.edit_text(
         (
             f"{mode} <b>{imported}</b> files from JSON.\n"
             f"Skipped records: <b>{skipped}</b>."
         ),
         parse_mode=ParseMode.HTML,
     )
+
+
+async def download_progress(current: int, total: int, status: Message, state: dict[str, float]) -> None:
+    loop_time = asyncio.get_running_loop().time()
+    if current < total and loop_time - state["last_edit"] < 5:
+        return
+    state["last_edit"] = loop_time
+    if total:
+        percent = current * 100 / total
+        text = (
+            "<b>JSON import in progress.</b>\n\n"
+            f"Downloading: <b>{percent:.1f}%</b>\n"
+            f"{current / 1024 / 1024:.1f} MB / {total / 1024 / 1024:.1f} MB"
+        )
+    else:
+        text = (
+            "<b>JSON import in progress.</b>\n\n"
+            f"Downloading: <b>{current / 1024 / 1024:.1f} MB</b>"
+        )
+    try:
+        await status.edit_text(text, parse_mode=ParseMode.HTML)
+    except RPCError:
+        pass
+
+
+def load_import_file(path: str) -> tuple[list[tuple[str, str, str | None]], int]:
+    with open(path, "r", encoding="utf-8-sig") as handle:
+        payload = json.load(handle)
+    return parse_import_payload(payload)
 
 
 def parse_import_payload(payload) -> tuple[list[tuple[str, str, str | None]], int]:
