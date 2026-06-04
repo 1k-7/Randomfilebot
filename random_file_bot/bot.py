@@ -103,6 +103,15 @@ def command_args(message: Message) -> list[str]:
     return text.split()[1:]
 
 
+def caption_command_is(message: Message, command: str) -> bool:
+    text = (message.caption or "").strip()
+    if not text.startswith("/"):
+        return False
+    token = text.split(maxsplit=1)[0][1:]
+    name = token.split("@", 1)[0].lower()
+    return name == command.lower()
+
+
 def user_label(stats: UserStats) -> str:
     if stats.username:
         return f"@{escape(stats.username)}"
@@ -124,6 +133,7 @@ def is_block_error(error: RPCError) -> bool:
 async def require_sudo(rt: BotRuntime, message: Message) -> bool:
     user = message.from_user
     if not user:
+        await message.reply_text("I can only accept admin commands from a visible user account.")
         return False
     if user.id == rt.config.owner_id or rt.db.is_sudo(user.id):
         return True
@@ -364,9 +374,12 @@ async def import_json_command(client: Client, rt: BotRuntime, message: Message) 
     if not await require_sudo(rt, message):
         return
     reply = message.reply_to_message
-    document = reply.document if reply else None
-    if not reply or not document:
-        await message.reply_text("Reply to a JSON document with /importjson or /importjson replace.")
+    source = reply if reply and reply.document else message if message.document else None
+    document = source.document if source else None
+    if not source or not document:
+        await message.reply_text(
+            "Send /importjson as a reply to a JSON file, or upload the JSON file with /importjson as its caption."
+        )
         return
     file_name = document.file_name or ""
     if file_name and not file_name.lower().endswith(".json"):
@@ -376,7 +389,7 @@ async def import_json_command(client: Client, rt: BotRuntime, message: Message) 
     args = command_args(message)
     replace = bool(args and args[0].lower() == "replace")
     try:
-        buffer = await reply.download(in_memory=True)
+        buffer = await source.download(in_memory=True)
         if not isinstance(buffer, io.BytesIO):
             await message.reply_text("I could not download that JSON file into memory.")
             return
@@ -389,11 +402,26 @@ async def import_json_command(client: Client, rt: BotRuntime, message: Message) 
     except RPCError:
         await message.reply_text("Telegram would not let me download that JSON file.")
         return
+    except Exception as error:
+        logging.exception("JSON import failed")
+        await message.reply_text(
+            f"Import failed before anything was written: <code>{escape(error.__class__.__name__)}</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
     if not files:
         await message.reply_text("No importable file records found. Each record needs an _id file ID.")
         return
-    imported = rt.db.import_files(files, added_by=message.from_user.id, replace=replace)
+    try:
+        imported = rt.db.import_files(files, added_by=message.from_user.id, replace=replace)
+    except Exception as error:
+        logging.exception("JSON import database write failed")
+        await message.reply_text(
+            f"Import failed while writing the DB: <code>{escape(error.__class__.__name__)}</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     mode = "Replaced the indexed-file DB with" if replace else "Imported"
     await message.reply_text(
         (
@@ -600,6 +628,17 @@ def build_client(config: Config, db: Database) -> Client:
     @app.on_message(filters.command("importjson"))
     async def import_json(client: Client, message: Message) -> None:
         await import_json_command(client, rt, message)
+
+    @app.on_message(filters.regex(re.compile(r"^/importjson(?:@\w+)?(?:\s|$)", re.IGNORECASE)))
+    async def import_json_regex(client: Client, message: Message) -> None:
+        await import_json_command(client, rt, message)
+
+    @app.on_message(filters.document)
+    async def import_json_caption(client: Client, message: Message) -> None:
+        if caption_command_is(message, "importjson"):
+            await import_json_command(client, rt, message)
+            return
+        await track_user(rt, message.from_user)
 
     @app.on_message(filters.command("delfile"))
     async def del_file_command(client: Client, message: Message) -> None:
