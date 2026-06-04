@@ -397,22 +397,6 @@ async def reset_file_message_to_start(
             reply_markup=start_keyboard(),
             disable_web_page_preview=True,
         )
-        # Some Telegram clients may accept the edit but leave media in place
-        # (resulting in a caption change instead of conversion to a text message).
-        # Detect that case and delete the message instead, matching the intended
-        # single-mode behavior described in README.
-        try:
-            msg = await client.get_messages(chat_id, message_id)
-            if msg is not None and any(
-                getattr(msg, attr, None)
-                for attr in ("photo", "video", "audio", "document", "animation")
-            ):
-                with suppress(RPCError):
-                    await client.delete_messages(chat_id=chat_id, message_ids=message_id)
-                return True
-        except RPCError:
-            # If we can't fetch the message, fall through and treat edit as success.
-            pass
         return True
     except RPCError:
         pass
